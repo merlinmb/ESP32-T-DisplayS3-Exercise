@@ -2,6 +2,7 @@ import json
 import os
 import sqlite3
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -162,6 +163,47 @@ class StravaBridgeApiTests(unittest.TestCase):
                 self.assertEqual(payload["busiest_date"], busiest_day)
                 self.assertGreater(payload["total_load"], 0.0)
                 self.assertTrue(any(day["load"] > 0 for day in payload["days"]))
+
+    def test_threaded_server_serves_parallel_requests(self):
+        class SlowHandler(strava_bridge.Handler):
+            def do_GET(self):
+                if self.headers.get("X-Delay") == "1":
+                    time.sleep(1.0)
+                super().do_GET()
+
+        with _temp_activity_db() as (db_path, _, _):
+            SlowHandler.db_path = db_path
+            server = strava_bridge.ThreadingHTTPServer(("127.0.0.1", 0), SlowHandler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                slow_url = f"http://127.0.0.1:{server.server_port}/api/exercise-load"
+                fast_url = slow_url
+
+                def slow_request():
+                    request = urllib.request.Request(slow_url, headers={"X-Delay": "1"})
+                    with urllib.request.urlopen(request, timeout=5) as response:
+                        self.assertEqual(response.status, 200)
+
+                slow_thread = threading.Thread(target=slow_request)
+                slow_thread.start()
+
+                time.sleep(0.1)
+
+                started = time.monotonic()
+                with urllib.request.urlopen(fast_url, timeout=2) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                elapsed = time.monotonic() - started
+
+                slow_thread.join(timeout=5)
+                self.assertFalse(slow_thread.is_alive())
+                self.assertEqual(response.status, 200)
+                self._assert_bridge_payload_shape(payload)
+                self.assertLess(elapsed, 0.75)
+            finally:
+                server.shutdown()
+                thread.join(timeout=5)
+                server.server_close()
 
     def test_get_exercise_load_supports_camel_case_schema(self):
         with _temp_activity_db_camel_case() as (db_path, first_day, busiest_day):

@@ -86,7 +86,10 @@ static void screen_switch_cb(lv_timer_t *t) {
 
 // ── Async data refresh via FreeRTOS task ──────────────────────────────────────
 
-static const uint32_t FETCH_TIMEOUT_MS  = 35000; // abort flag set after this long
+// The HTTP client has its own 15 s connect + 15 s read timeouts, so a single
+// attempt takes at most ~30 s. With 3 retries + 5 s gaps the worst case is
+// ~115 s. Set the outer watchdog well above that so it only fires on a true hang.
+static const uint32_t FETCH_TIMEOUT_MS  = 120000;
 static const int      FETCH_MAX_RETRIES = 3;
 static const uint32_t FETCH_RETRY_MS    = 5000;
 
@@ -102,8 +105,11 @@ static TaskHandle_t        g_fetch_task  = nullptr;
 static void fetch_task(void *) {
     bool ok = false;
     for (int attempt = 1; attempt <= FETCH_MAX_RETRIES && !g_fetch_abort; attempt++) {
-        Serial.printf("[Fetch] Attempt %d/%d\n", attempt, FETCH_MAX_RETRIES);
+        Serial.printf("[Fetch] Attempt %d/%d (abort=%d)\n", attempt, FETCH_MAX_RETRIES, (int)g_fetch_abort);
+        uint32_t t0 = millis();
         ok = strava_fetch(g_cfg.strava_server_url, g_fetch_result);
+        Serial.printf("[Fetch] strava_fetch done in %lu ms, ok=%d, abort=%d\n",
+                      millis() - t0, (int)ok, (int)g_fetch_abort);
         if (ok) break;
         if (attempt < FETCH_MAX_RETRIES && !g_fetch_abort) {
             Serial.printf("[Fetch] Failed, retrying in %u ms...\n", FETCH_RETRY_MS);
@@ -113,35 +119,49 @@ static void fetch_task(void *) {
         }
     }
     __asm__ volatile("" ::: "memory");
-    g_fetch_state = (ok && !g_fetch_abort) ? FETCH_DONE_OK : FETCH_DONE_FAIL;
+    FetchState next = (ok && !g_fetch_abort) ? FETCH_DONE_OK : FETCH_DONE_FAIL;
+    Serial.printf("[Fetch] Task ending: ok=%d abort=%d -> state=%s\n",
+                  (int)ok, (int)g_fetch_abort, next == FETCH_DONE_OK ? "DONE_OK" : "DONE_FAIL");
+    g_fetch_state = next;
     g_fetch_task  = nullptr;
     vTaskDelete(nullptr);
 }
 
 // Called from main loop — applies a completed fetch result to the display.
 static void apply_fetch_result(bool ok) {
+    Serial.printf("[Apply] ok=%d display_ready=%d valid=%d week_count=%d\n",
+                  (int)ok, (int)g_display_ready,
+                  (int)g_fetch_result.valid, (int)g_fetch_result.week_count);
     if (ok) {
         g_last_fetch_ms = millis();
         g_data = g_fetch_result;
         if (g_display_ready) {
+            Serial.println("[Apply] Calling display_grid_update...");
             display_grid_update(g_data, g_cfg);
+            Serial.println("[Apply] display_grid_update done");
             display_stats_update(g_data);
             display_stats_set_age(0);
+        } else {
+            Serial.println("[Apply] SKIPPED — display not ready");
         }
     } else {
-        Serial.println("[Fetch] All attempts failed");
+        Serial.println("[Fetch] All attempts failed — display not updated");
     }
     rgb_led_update_params(g_data, g_cfg);
 }
 
-// Kick off an async fetch. If one is already running, do nothing.
+// Kick off an async fetch. If one is already running or WiFi is down, do nothing.
 static void do_fetch() {
     if (g_fetch_state == FETCH_RUNNING) return;
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("[Fetch] Skipping — WiFi not connected");
+        return;
+    }
     display_grid_stop_animations();
     g_fetch_abort  = false;
     g_fetch_state  = FETCH_RUNNING;
     memset(&g_fetch_result, 0, sizeof(g_fetch_result));
-    xTaskCreate(fetch_task, "strava_fetch", 12288, nullptr, 1, &g_fetch_task);
+    xTaskCreate(fetch_task, "strava_fetch", 16384, nullptr, 1, &g_fetch_task);
 }
 
 // Called every loop iteration — checks if the fetch task finished or timed out.
@@ -154,7 +174,8 @@ static void fetch_tick() {
             g_fetch_started_ms = millis() | 1u; // |1 avoids the 0 sentinel without a branch
 
         if (millis() - g_fetch_started_ms >= FETCH_TIMEOUT_MS) {
-            Serial.println("[Fetch] Timeout — requesting abort");
+            Serial.printf("[Fetch] Timeout after %lu ms — requesting abort\n",
+                          millis() - g_fetch_started_ms);
             g_fetch_abort = true;
             // Give the task up to 3 s to see the flag and exit cleanly.
             // If it still hasn't stopped, force-delete as a last resort.
@@ -212,13 +233,15 @@ static void wifi_connect_splash() {
     lv_label_set_text_fmt(lbl, "Connecting to\n%s", ssid);
     lv_obj_align_to(lbl, spinner, LV_ALIGN_OUT_BOTTOM_MID, 0, 12);
 
+    WiFi.setAutoReconnect(true);
+    WiFi.persistent(false);
     WiFi.mode(WIFI_STA);
     WiFi.begin(ssid, pass);
     uint32_t wifi_start_ms = millis();
     while (WiFi.status() != WL_CONNECTED) {
         lv_timer_handler();
-        delay(10);
-        if (millis() - wifi_start_ms >= 20000) {
+        delay(50);
+        if (millis() - wifi_start_ms >= 30000) {
             Serial.println("[WiFi] Connect timeout — continuing without WiFi");
             break;
         }
@@ -295,8 +318,14 @@ void setup() {
     gfx->fillScreen(RGB565_BLACK);
     set_screen_brightness_pct(100); // full brightness during splash
 
+    Serial.printf("[Heap] Before fonts: free=%lu largest=%lu\n",
+                  (unsigned long)esp_get_free_heap_size(),
+                  (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     lvgl_init();
     ui_fonts_init();
+    Serial.printf("[Heap] After fonts:  free=%lu largest=%lu\n",
+                  (unsigned long)esp_get_free_heap_size(),
+                  (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 
     config_load(g_cfg);
     gfx->setRotation(g_cfg.flip_screen ? 3 : 1); // apply saved orientation
@@ -362,12 +391,19 @@ void setup() {
 // prolonged outage. This watchdog calls WiFi.reconnect() if the link has been
 // down for more than WIFI_RECONNECT_MS, which kicks the driver without a reboot.
 
-static const uint32_t WIFI_RECONNECT_MS = 30000; // 30 s before forcing reconnect
+static const uint32_t WIFI_RECONNECT_MS  = 15000; // 15 s before forcing reconnect
+static const uint32_t WIFI_HARD_RESET_MS = 60000; // 60 s before full disconnect+reconnect
 static uint32_t g_wifi_lost_ms = 0;
+static uint32_t g_wifi_reconnect_count = 0;
 
 static void wifi_watchdog_tick() {
     if (WiFi.status() == WL_CONNECTED) {
-        g_wifi_lost_ms = 0;
+        if (g_wifi_lost_ms != 0) {
+            Serial.printf("[WiFi] Reconnected after %lu ms (attempt #%lu)\n",
+                          millis() - g_wifi_lost_ms, g_wifi_reconnect_count);
+            g_wifi_lost_ms = 0;
+            g_wifi_reconnect_count = 0;
+        }
         return;
     }
     uint32_t now = millis();
@@ -376,13 +412,27 @@ static void wifi_watchdog_tick() {
         Serial.println("[WiFi] Lost connection");
         return;
     }
-    if (now - g_wifi_lost_ms >= WIFI_RECONNECT_MS) {
-        // Don't tear down the radio while a fetch task is mid-TLS handshake —
-        // that would leave the socket in an unrecoverable state.
-        if (g_fetch_state == FETCH_RUNNING) return;
-        Serial.println("[WiFi] Reconnecting...");
+    uint32_t lost_ms = now - g_wifi_lost_ms;
+
+    // Don't touch the radio while a fetch task is active — the fetch has its
+    // own timeout and will fail cleanly; we reconnect after it finishes.
+    if (g_fetch_state == FETCH_RUNNING) return;
+
+    if (lost_ms >= WIFI_HARD_RESET_MS && g_wifi_reconnect_count >= 2) {
+        // Full teardown+reconnect after multiple soft-reconnect attempts fail
+        Serial.println("[WiFi] Hard reset — disconnect + begin");
+        const char *ssid = g_cfg.wifi_ssid[0] ? g_cfg.wifi_ssid : WIFI_SSID;
+        const char *pass = g_cfg.wifi_password[0] ? g_cfg.wifi_password : WIFI_PASSWORD;
+        WiFi.disconnect(false, true);
+        delay(200);
+        WiFi.begin(ssid, pass);
+        g_wifi_lost_ms = now;
+        g_wifi_reconnect_count = 0;
+    } else if (lost_ms >= WIFI_RECONNECT_MS) {
+        Serial.printf("[WiFi] Soft reconnect (attempt #%lu)\n", g_wifi_reconnect_count + 1);
         WiFi.reconnect();
-        g_wifi_lost_ms = now; // reset timer so we don't spam reconnect
+        g_wifi_lost_ms = now;
+        g_wifi_reconnect_count++;
     }
 }
 

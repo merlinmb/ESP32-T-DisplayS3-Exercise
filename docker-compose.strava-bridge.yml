@@ -26,7 +26,7 @@ services:
         - -c
         - "import urllib.request; urllib.request.urlopen('http://localhost:8082/api/exercise-load')"
       interval: 30s
-      timeout: 5s
+      timeout: 15s
       retries: 3
       start_period: 15s
 

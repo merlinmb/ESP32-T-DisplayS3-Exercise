@@ -17,8 +17,8 @@ VOLUME ["/data"]
 
 EXPOSE 8082
 
-# Health-check: hit the endpoint every 30 s, allow 5 s per attempt
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+# Health-check: hit the endpoint every 30 s, allow 15 s per attempt
+HEALTHCHECK --interval=30s --timeout=15s --start-period=10s --retries=3 \
     CMD python3 -c \
         "import urllib.request; urllib.request.urlopen('http://localhost:8082/api/exercise-load')" \
     || exit 1

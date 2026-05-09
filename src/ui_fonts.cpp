@@ -17,9 +17,9 @@ bool ui_fonts_init() {
 #if LV_USE_TINY_TTF
     if (g_smooth_font_size > 0) {
         s_label_font = lv_tiny_ttf_create_data_ex(g_smooth_font_data, g_smooth_font_size,
-                                                  18, LV_FONT_KERNING_NORMAL, 96);
+                                                  18, LV_FONT_KERNING_NORMAL, 48);
         s_stat_font = lv_tiny_ttf_create_data_ex(g_smooth_font_data, g_smooth_font_size,
-                                                 34, LV_FONT_KERNING_NORMAL, 128);
+                                                 34, LV_FONT_KERNING_NORMAL, 64);
     }
 #endif
 

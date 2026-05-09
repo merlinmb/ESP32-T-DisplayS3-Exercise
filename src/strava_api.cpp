@@ -177,19 +177,38 @@ bool strava_fetch(const char *url, StravaData &data) {
         return false;
     }
 
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("[Strava] WiFi not connected");
+        return false;
+    }
+
     HTTPClient http;
-    http.setTimeout(10000);
-    http.setConnectTimeout(8000);
+    http.setTimeout(15000);
+    http.setConnectTimeout(10000);
+    http.setReuse(false);
     if (!http.begin(url)) {
         Serial.println("[Strava] http.begin() failed");
         return false;
     }
     http.addHeader("Accept", "application/json");
+    http.addHeader("Connection", "close");
     http.addHeader("User-Agent", "ESP32-T-DisplayS3-Strava");
 
     int code = http.GET();
+    if (code <= 0) {
+        Serial.printf("[Strava] HTTP error %d (%s) from %s\n", code, http.errorToString(code).c_str(), url);
+        http.end();
+        return false;
+    }
     if (code != 200) {
         Serial.printf("[Strava] HTTP %d from %s\n", code, url);
+        http.end();
+        return false;
+    }
+
+    int content_len = http.getSize();
+    if (content_len > BODY_BUF_SIZE - 1) {
+        Serial.printf("[Strava] Content-Length %d exceeds buffer %d\n", content_len, BODY_BUF_SIZE);
         http.end();
         return false;
     }

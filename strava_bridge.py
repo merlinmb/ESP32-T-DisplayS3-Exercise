@@ -38,7 +38,7 @@ import sqlite3
 import json
 import argparse
 from datetime import datetime, timedelta
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 
 DB_PATH_DEFAULT = "/home/merlin/portainer_data/strava/storage/database"
@@ -226,7 +226,7 @@ if __name__ == "__main__":
     print(f"  Endpoint : http://0.0.0.0:{args.port}/api/exercise-load")
     print("=" * 60)
 
-    httpd = HTTPServer(("0.0.0.0", args.port), Handler)
+    httpd = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
