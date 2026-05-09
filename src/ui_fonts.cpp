@@ -1,9 +1,13 @@
 #include "ui_fonts.h"
 
+#define UI_USE_RUNTIME_TTF 0
+
+#if UI_USE_RUNTIME_TTF
 #include "fonts/smooth_font_data.h"
 
 #if LV_USE_TINY_TTF
 #include <src/libs/tiny_ttf/lv_tiny_ttf.h>
+#endif
 #endif
 
 static lv_font_t *s_label_font = nullptr;
@@ -14,7 +18,7 @@ bool ui_fonts_init() {
     if (s_init_attempted) return (s_label_font != nullptr && s_stat_font != nullptr);
     s_init_attempted = true;
 
-#if LV_USE_TINY_TTF
+#if UI_USE_RUNTIME_TTF && LV_USE_TINY_TTF
     if (g_smooth_font_size > 0) {
         s_label_font = lv_tiny_ttf_create_data_ex(g_smooth_font_data, g_smooth_font_size,
                                                   18, LV_FONT_KERNING_NORMAL, 48);
@@ -23,7 +27,7 @@ bool ui_fonts_init() {
     }
 #endif
 
-    return (s_label_font != nullptr && s_stat_font != nullptr);
+    return true;
 }
 
 const lv_font_t *ui_font_label() {

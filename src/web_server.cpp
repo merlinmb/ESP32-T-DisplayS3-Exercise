@@ -13,7 +13,7 @@ static String build_page() {
     String ip = ap_mode ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
 
     String html;
-    html.reserve(4096);
+    html.reserve(6144);
 
     html += F("<!DOCTYPE html><html lang='en'><head>"
               "<meta charset='UTF-8'>"
@@ -60,17 +60,15 @@ static String build_page() {
         html += kSetupApSsid;
         html += F(" then visit 192.168.4.1</span>");
     }
-    html += F("</div><form id='cfg'>");
+    html += F("</div><form id='cfg' autocomplete='off'>");
 
     // WiFi card
     html += F("<div class='card'><h2>WiFi</h2>"
               "<label>SSID</label>"
               "<input type='text' name='wifi_ssid' value='");
     html += s_cfg->wifi_ssid;
-    html += F("'><label>Password</label>"
-              "<input type='password' name='wifi_pass' value='");
-    html += s_cfg->wifi_password;
-    html += F("'></div>");
+    html += F("'><label>Password (leave blank to keep existing)</label>"
+              "<input type='password' name='wifi_pass' placeholder='unchanged' value='' autocomplete='new-password'></div>");
 
     // Strava bridge card
     html += F("<div class='card'><h2>Strava Bridge</h2>"
@@ -95,6 +93,9 @@ static String build_page() {
     html += F("'><label>Data refresh interval (minutes)</label>"
               "<input type='number' name='refresh_min' min='1' max='1440' value='");
     html += s_cfg->refresh_interval_min;
+    html += F("'><label>Grid history shown (months)</label>"
+              "<input type='number' name='hist_months' min='1' max='12' value='");
+    html += s_cfg->history_months;
     html += F("'>"
               "<label style='display:flex;align-items:center;gap:8px;margin-top:10px;cursor:pointer'>"
               "<input type='checkbox' name='flip_screen' value='1'");
@@ -117,27 +118,6 @@ static String build_page() {
     html += s_cfg->anim_period_ms;
     html += F("'></div>");
 
-    // RGB LED card
-    html += F("<div class='card'><h2>RGB LED</h2>"
-              "<label>LED Brightness (%)</label>"
-              "<div class='range-row'>"
-              "<input type='range' name='rgb_bright' min='1' max='100' value='");
-    html += s_cfg->rgb_brightness;
-    html += F("' oninput='this.nextElementSibling.textContent=this.value+\"%\"'>"
-              "<span class='range-val'>");
-    html += s_cfg->rgb_brightness;
-    html += F("%</span></div>"
-              "<label>Min breath period ms (fastest, at max load)</label>"
-              "<input type='number' name='rgb_pmin' min='400' max='4000' value='");
-    html += s_cfg->rgb_period_min_ms;
-    html += F("'><label>Max breath period ms (slowest, no activity)</label>"
-              "<input type='number' name='rgb_pmax' min='2000' max='20000' value='");
-    html += s_cfg->rgb_period_max_ms;
-    html += F("'><label>Load target (minutes that achieves max LED speed)</label>"
-              "<input type='number' name='rgb_smax' min='1' max='365' value='");
-    html += s_cfg->rgb_streak_max;
-    html += F("'></div>");
-
     // MQTT card
     html += F("<div class='card'><h2>MQTT</h2>"
               "<label>Broker host / IP (leave empty to disable)</label>"
@@ -146,15 +126,9 @@ static String build_page() {
     html += F("'><label>Broker port</label>"
               "<input type='number' name='mqtt_port' min='1' max='65535' value='");
     html += s_cfg->mqtt_port;
-    html += F("'><label>Combined brightness topic &#8212; sets LCD &amp; LED (0&#8211;100)</label>"
-              "<input type='text' name='mqtt_ctopic' value='");
-    html += s_cfg->mqtt_combined_topic;
-    html += F("'><label>LCD-only brightness topic (0&#8211;100)</label>"
+    html += F("'><label>LCD brightness topic (0&#8211;100)</label>"
               "<input type='text' name='mqtt_lcd' value='");
     html += s_cfg->mqtt_lcd_topic;
-    html += F("'><label>LED-only brightness topic (0&#8211;100)</label>"
-              "<input type='text' name='mqtt_ltopic' value='");
-    html += s_cfg->mqtt_led_brightness_topic;
     html += F("'></div>");
 
     html += F("<div class='btn-row'>"
@@ -212,26 +186,24 @@ static void handle_save() {
         }
     };
 
-    get_str("wifi_ssid", s_cfg->wifi_ssid,          sizeof(s_cfg->wifi_ssid));
-    get_str("wifi_pass", s_cfg->wifi_password,      sizeof(s_cfg->wifi_password));
-    get_str("srv_url",   s_cfg->strava_server_url,  sizeof(s_cfg->strava_server_url));
+    get_str("wifi_ssid", s_cfg->wifi_ssid,         sizeof(s_cfg->wifi_ssid));
+    // Only update password if the field was filled in — blank means "keep existing"
+    if (server.hasArg("wifi_pass") && server.arg("wifi_pass").length() > 0)
+        get_str("wifi_pass", s_cfg->wifi_password, sizeof(s_cfg->wifi_password));
+    get_str("srv_url",   s_cfg->strava_server_url, sizeof(s_cfg->strava_server_url));
 
     if (server.hasArg("brightness"))  s_cfg->brightness           = (uint8_t) server.arg("brightness").toInt();
     if (server.hasArg("switch_sec"))  s_cfg->screen_switch_secs   = (uint16_t)server.arg("switch_sec").toInt();
     if (server.hasArg("refresh_min")) s_cfg->refresh_interval_min = (uint16_t)server.arg("refresh_min").toInt();
+    if (server.hasArg("hist_months")) s_cfg->history_months       = (uint8_t) server.arg("hist_months").toInt();
     if (server.hasArg("anim_pct"))    s_cfg->anim_top_pct         = (uint8_t) server.arg("anim_pct").toInt();
     if (server.hasArg("anim_ms"))     s_cfg->anim_period_ms       = (uint16_t)server.arg("anim_ms").toInt();
-    if (server.hasArg("rgb_pmin")) s_cfg->rgb_period_min_ms = (uint16_t)server.arg("rgb_pmin").toInt();
-    if (server.hasArg("rgb_pmax")) s_cfg->rgb_period_max_ms = (uint16_t)server.arg("rgb_pmax").toInt();
-    if (server.hasArg("rgb_smax")) s_cfg->rgb_streak_max    = (uint8_t) server.arg("rgb_smax").toInt();
-    if (server.hasArg("rgb_bright")) s_cfg->rgb_brightness  = (uint8_t) server.arg("rgb_bright").toInt();
     s_cfg->flip_screen = server.hasArg("flip_screen") ? 1 : 0;
     get_str("mqtt_host",    s_cfg->mqtt_broker,              sizeof(s_cfg->mqtt_broker));
     if (server.hasArg("mqtt_port")) s_cfg->mqtt_port        = (uint16_t)server.arg("mqtt_port").toInt();
-    get_str("mqtt_ctopic", s_cfg->mqtt_combined_topic,      sizeof(s_cfg->mqtt_combined_topic));
     get_str("mqtt_lcd",    s_cfg->mqtt_lcd_topic,           sizeof(s_cfg->mqtt_lcd_topic));
-    get_str("mqtt_ltopic", s_cfg->mqtt_led_brightness_topic,sizeof(s_cfg->mqtt_led_brightness_topic));
 
+    config_apply_defaults(*s_cfg);
     config_save(*s_cfg);
 
     if (s_apply_fn) s_apply_fn(*s_cfg);

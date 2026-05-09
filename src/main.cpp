@@ -11,7 +11,6 @@
 #include "display_grid.h"
 #include "display_stats.h"
 #include "web_server.h"
-#include "rgb_led.h"
 #include "ui_fonts.h"
 #include "screen_brightness.h"
 #include "mqtt_client.h"
@@ -96,11 +95,16 @@ static const uint32_t FETCH_RETRY_MS    = 5000;
 // State shared between main loop and fetch task.
 // g_fetch_abort is written by the main loop and read by the task; volatile is
 // sufficient because it is only ever set true (no torn read/write issue).
+// g_fetch_task is written by BOTH the task (self-null on exit) and the main loop
+// watchdog — access must be guarded by g_fetch_task_mux on SMP cores.
 enum FetchState { FETCH_IDLE, FETCH_RUNNING, FETCH_DONE_OK, FETCH_DONE_FAIL };
 static volatile FetchState g_fetch_state = FETCH_IDLE;
 static volatile bool       g_fetch_abort = false; // ask task to stop early
 static StravaData          g_fetch_result;
 static TaskHandle_t        g_fetch_task  = nullptr;
+static portMUX_TYPE        g_fetch_task_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t            g_fetch_started_ms = 0;
+static uint32_t            g_fetch_abort_ms   = 0; // non-zero while waiting for task to exit
 
 static void fetch_task(void *) {
     bool ok = false;
@@ -119,11 +123,13 @@ static void fetch_task(void *) {
         }
     }
     __asm__ volatile("" ::: "memory");
-    FetchState next = (ok && !g_fetch_abort) ? FETCH_DONE_OK : FETCH_DONE_FAIL;
+    FetchState next = ok ? FETCH_DONE_OK : FETCH_DONE_FAIL;
     Serial.printf("[Fetch] Task ending: ok=%d abort=%d -> state=%s\n",
                   (int)ok, (int)g_fetch_abort, next == FETCH_DONE_OK ? "DONE_OK" : "DONE_FAIL");
+    portENTER_CRITICAL(&g_fetch_task_mux);
+    g_fetch_task = nullptr;
+    portEXIT_CRITICAL(&g_fetch_task_mux);
     g_fetch_state = next;
-    g_fetch_task  = nullptr;
     vTaskDelete(nullptr);
 }
 
@@ -147,7 +153,6 @@ static void apply_fetch_result(bool ok) {
     } else {
         Serial.println("[Fetch] All attempts failed — display not updated");
     }
-    rgb_led_update_params(g_data, g_cfg);
 }
 
 // Kick off an async fetch. If one is already running or WiFi is down, do nothing.
@@ -158,43 +163,64 @@ static void do_fetch() {
         return;
     }
     display_grid_stop_animations();
+    g_fetch_started_ms = 0;
+    g_fetch_abort_ms   = 0;
     g_fetch_abort  = false;
     g_fetch_state  = FETCH_RUNNING;
     memset(&g_fetch_result, 0, sizeof(g_fetch_result));
-    xTaskCreate(fetch_task, "strava_fetch", 16384, nullptr, 1, &g_fetch_task);
+    if (xTaskCreate(fetch_task, "strava_fetch", 16384, nullptr, 1, &g_fetch_task) != pdPASS) {
+        Serial.println("[Fetch] Task create failed — heap exhausted");
+        g_fetch_state = FETCH_IDLE;
+    }
 }
 
 // Called every loop iteration — checks if the fetch task finished or timed out.
-static uint32_t g_fetch_started_ms = 0;
+// The abort-drain window is non-blocking: we set a timestamp and return, checking
+// each loop() call whether the task has exited or the 3 s window has elapsed.
+// This keeps MQTT/web-server/LVGL alive during the drain.
 static void fetch_tick() {
     if (g_fetch_state == FETCH_IDLE) return;
 
     if (g_fetch_state == FETCH_RUNNING) {
         if (g_fetch_started_ms == 0)
-            g_fetch_started_ms = millis() | 1u; // |1 avoids the 0 sentinel without a branch
+            g_fetch_started_ms = millis() | 1u;
+
+        // Non-blocking drain: if we already signalled abort, just wait for the
+        // task to null its own handle (or force-kill after 3 s).
+        if (g_fetch_abort_ms != 0) {
+            portENTER_CRITICAL(&g_fetch_task_mux);
+            TaskHandle_t h = g_fetch_task;
+            portEXIT_CRITICAL(&g_fetch_task_mux);
+
+            if (h == nullptr) {
+                return;
+            }
+
+            if (millis() - g_fetch_abort_ms >= 3000) {
+                Serial.println("[Fetch] Force-killing stuck task");
+                portENTER_CRITICAL(&g_fetch_task_mux);
+                vTaskDelete(g_fetch_task);
+                g_fetch_task = nullptr;
+                portEXIT_CRITICAL(&g_fetch_task_mux);
+                g_fetch_state      = FETCH_DONE_FAIL;
+                g_fetch_started_ms = 0;
+                g_fetch_abort_ms   = 0;
+            }
+            return;
+        }
 
         if (millis() - g_fetch_started_ms >= FETCH_TIMEOUT_MS) {
             Serial.printf("[Fetch] Timeout after %lu ms — requesting abort\n",
                           millis() - g_fetch_started_ms);
-            g_fetch_abort = true;
-            // Give the task up to 3 s to see the flag and exit cleanly.
-            // If it still hasn't stopped, force-delete as a last resort.
-            uint32_t wait_start = millis();
-            while (g_fetch_task && (millis() - wait_start < 3000))
-                delay(50);
-            if (g_fetch_task) {
-                Serial.println("[Fetch] Force-killing stuck task");
-                vTaskDelete(g_fetch_task);
-                g_fetch_task = nullptr;
-            }
-            g_fetch_state      = FETCH_DONE_FAIL;
-            g_fetch_started_ms = 0;
+            g_fetch_abort    = true;
+            g_fetch_abort_ms = millis() | 1u;
         }
         return;
     }
 
     // Task finished normally
     g_fetch_started_ms = 0;
+    g_fetch_abort_ms   = 0;
     bool ok = (g_fetch_state == FETCH_DONE_OK);
     g_fetch_state = FETCH_IDLE;
     apply_fetch_result(ok);
@@ -330,7 +356,6 @@ void setup() {
     config_load(g_cfg);
     gfx->setRotation(g_cfg.flip_screen ? 3 : 1); // apply saved orientation
     set_screen_brightness_pct(g_cfg.brightness);
-    rgb_led_init(g_cfg);
 
     if (g_cfg.wifi_ssid[0] == '\0') {
         // No WiFi creds in NVS — start AP setup mode
@@ -347,7 +372,6 @@ void setup() {
         web_server_start(g_cfg, [](const Config &cfg) {
             gfx->setRotation(cfg.flip_screen ? 3 : 1);
             set_screen_brightness_pct(cfg.brightness);
-            rgb_led_set_brightness_pct(cfg.rgb_brightness);
         });
         // Stay in AP loop — web server POST /save will reboot device
         while (true) {
@@ -361,13 +385,12 @@ void setup() {
     web_server_start(g_cfg, [](const Config &cfg) {
         gfx->setRotation(cfg.flip_screen ? 3 : 1);
         set_screen_brightness_pct(cfg.brightness);
-        rgb_led_set_brightness_pct(cfg.rgb_brightness);
-        rgb_led_update_params(g_data, cfg);
         mqtt_client_reinit();
+        if (g_display_ready) display_grid_update(g_data, cfg);
     });
     mqtt_client_init(g_cfg);
 
-    g_screen_grid  = display_grid_build("Exercise Load");
+    g_screen_grid  = display_grid_build("Exercise Load", g_cfg);
     g_screen_stats = display_stats_build("Exercise Load");
     g_display_ready = (g_screen_grid != nullptr && g_screen_stats != nullptr);
 
@@ -442,7 +465,6 @@ void loop() {
     wifi_watchdog_tick();
     fetch_tick();
     lv_timer_handler();
-    rgb_led_tick();
     web_server_handle();
     mqtt_client_tick();
     delay(5);

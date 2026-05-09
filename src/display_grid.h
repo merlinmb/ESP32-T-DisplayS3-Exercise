@@ -4,7 +4,7 @@
 #include "config.h"
 
 // Build the grid screen. Call once after LVGL init.
-lv_obj_t *display_grid_build(const char *title);
+lv_obj_t *display_grid_build(const char *title, const Config &cfg);
 
 // Update cell colours and reassign animations from fresh data.
 void display_grid_update(const StravaData &data, const Config &cfg);

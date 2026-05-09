@@ -1,7 +1,7 @@
 #pragma once
 #include "config.h"
 
-// Called after save to apply live-applicable settings (brightness, LED, etc.)
+// Called after save to apply live-applicable settings (brightness, orientation, MQTT, etc.)
 typedef void (*ConfigApplyFn)(const Config &);
 
 // Start the web server. cfg is used to pre-fill the form and updated on save.

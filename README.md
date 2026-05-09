@@ -11,7 +11,7 @@ The app no longer depends on GitHub credentials, GitHub APIs, or GitHub contribu
 - Hosts a browser-based config page for WiFi, bridge URL, brightness, animation, orientation, and MQTT topics.
 - Uses NVS so device settings survive reboots.
 - Supports an AP-based first-boot flow when WiFi is not configured.
-- Optionally exposes brightness control over MQTT.
+- Optionally exposes LCD brightness control over MQTT.
 
 ## Architecture
 
@@ -29,6 +29,7 @@ The device fetches exercise data from the bridge over HTTP, not directly from St
 | Board | LilyGo T-Display S3 |
 | MCU | ESP32-S3 |
 | Display | Integrated ST7789V 170x320 LCD |
+| RGB LED | None on this board |
 | Framework | Arduino via PlatformIO |
 | UI | LVGL v9 |
 
@@ -40,10 +41,11 @@ The bridge responds with JSON shaped like this:
 
 ```json
 {
-  "generated_at": "2026-05-08T12:00:00",
+  "generated_at": "2026-05-08T12:00:00+00:00",
+  "start": "2025-06-01",
   "weeks": 53,
   "days": [
-    {"date": "2025-06-01", "load": 45.5}
+    [0, 45.5]
   ],
   "total_load": 12345.0,
   "total_activities": 156,
@@ -52,7 +54,7 @@ The bridge responds with JSON shaped like this:
 }
 ```
 
-`load` is daily moving time in minutes.
+`start` is the Sunday for offset `0`. Each `days` entry is `[offset, load]`, where `offset` is days since `start` and `load` is daily moving time in minutes. Zero-load days are omitted.
 
 ## Quick Start
 
@@ -135,17 +137,11 @@ Once the device joins your network, the config page is available at `http://<dev
 | Flip screen | `flip_scr` | 180-degree rotation toggle |
 | Animation top percent | `anim_pct` | Top percentage of active days that breathe |
 | Animation period | `anim_ms` | Breathing animation period in ms |
-| LED brightness | `rgb_bright` | Optional RGB brightness from 0-100 |
-| Min breath period | `rgb_pmin` | Fastest LED breath period |
-| Max breath period | `rgb_pmax` | Slowest LED breath period |
-| Load target | `rgb_smax` | Daily minutes that hit max LED speed |
 | MQTT broker | `mqtt_host` | Broker host or IP |
 | MQTT port | `mqtt_port` | Broker port |
-| Combined brightness topic | `mqtt_ctopic` | Sets LCD and LED brightness |
-| LCD brightness topic | `mqtt_lcd` | LCD-only brightness topic |
-| LED brightness topic | `mqtt_ltopic` | LED-only brightness topic |
+| LCD brightness topic | `mqtt_lcd` | LCD brightness topic |
 
-Brightness, rotation, and LED settings apply immediately. WiFi and bridge URL changes require a reboot.
+Brightness and rotation settings apply immediately. WiFi and bridge URL changes require a reboot.
 
 ## Bridge Deployment Notes
 
@@ -164,7 +160,7 @@ Those values are environment-specific and should stay out of tracked commits.
 Run the bridge tests with:
 
 ```powershell
-python -m unittest tests.test_strava_bridge
+python -m unittest discover -s tests -p test_strava_bridge.py
 ```
 
 The test suite:

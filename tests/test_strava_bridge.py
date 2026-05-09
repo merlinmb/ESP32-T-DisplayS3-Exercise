@@ -7,7 +7,7 @@ import unittest
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
@@ -23,12 +23,11 @@ import strava_bridge
 
 REMOTE_BRIDGE_URL = os.environ.get(
     "STRAVA_BRIDGE_REMOTE_URL",
-    "http://192.168.1.54:8082/api/exercise-load",
 )
 
 
 def _current_window():
-    today = datetime.utcnow().date()
+    today = datetime.now(timezone.utc).date()
     days_since_sunday = (today.weekday() + 1) % 7
     current_sunday = today - timedelta(days=days_since_sunday)
     start_date = current_sunday - timedelta(weeks=strava_bridge.WEEKS - 1)
@@ -125,14 +124,14 @@ def _serve_api(db_path):
 class StravaBridgeApiTests(unittest.TestCase):
     def _assert_bridge_payload_shape(self, payload):
         self.assertEqual(payload["weeks"], strava_bridge.WEEKS)
-        self.assertEqual(len(payload["days"]), strava_bridge.WEEKS * 7)
+        self.assertIn("start", payload)
         self.assertIn("generated_at", payload)
         datetime.fromisoformat(payload["generated_at"])
         self.assertIn("total_load", payload)
         self.assertIn("total_activities", payload)
         self.assertIn("busiest_date", payload)
         self.assertIn("busiest_load", payload)
-        self.assertTrue(all("date" in day and "load" in day for day in payload["days"]))
+        self.assertTrue(all(isinstance(day, list) and len(day) == 2 for day in payload["days"]))
 
     def test_get_exercise_load_returns_expected_aggregates(self):
         with _temp_activity_db() as (db_path, first_day, busiest_day):
@@ -144,7 +143,11 @@ class StravaBridgeApiTests(unittest.TestCase):
         self.assertEqual(payload["busiest_date"], busiest_day)
         self.assertEqual(payload["busiest_load"], 120.0)
 
-        loads_by_day = {entry["date"]: entry["load"] for entry in payload["days"]}
+        start_date = datetime.fromisoformat(payload["start"]).date()
+        loads_by_day = {
+            (start_date + timedelta(days=offset)).isoformat(): load
+            for offset, load in payload["days"]
+        }
         self.assertEqual(loads_by_day[first_day], 45.0)
         self.assertEqual(loads_by_day[busiest_day], 120.0)
 
@@ -162,7 +165,7 @@ class StravaBridgeApiTests(unittest.TestCase):
                 self._assert_bridge_payload_shape(payload)
                 self.assertEqual(payload["busiest_date"], busiest_day)
                 self.assertGreater(payload["total_load"], 0.0)
-                self.assertTrue(any(day["load"] > 0 for day in payload["days"]))
+                self.assertTrue(any(load > 0 for _, load in payload["days"]))
 
     def test_threaded_server_serves_parallel_requests(self):
         class SlowHandler(strava_bridge.Handler):
@@ -215,10 +218,43 @@ class StravaBridgeApiTests(unittest.TestCase):
         self.assertEqual(payload["busiest_date"], busiest_day)
         self.assertEqual(payload["busiest_load"], 90.0)
 
-        loads_by_day = {entry["date"]: entry["load"] for entry in payload["days"]}
+        start_date = datetime.fromisoformat(payload["start"]).date()
+        loads_by_day = {
+            (start_date + timedelta(days=offset)).isoformat(): load
+            for offset, load in payload["days"]
+        }
         self.assertEqual(loads_by_day[first_day], 25.0)
         self.assertEqual(loads_by_day[busiest_day], 90.0)
 
+    def test_get_exercise_load_quotes_schema_identifiers(self):
+        start_date, _, _ = _current_window()
+        sample_day = start_date + timedelta(days=3)
+
+        with NamedTemporaryFile(suffix=".sqlite3", delete=False) as temp_db:
+            db_path = temp_db.name
+
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute(
+                'CREATE TABLE "activities""; DROP TABLE activities; --" ('
+                '"start_date_local" TEXT NOT NULL, '
+                '"moving_time_in_seconds" INTEGER NOT NULL)'
+            )
+            conn.execute(
+                'INSERT INTO "activities""; DROP TABLE activities; --" '
+                '("start_date_local", "moving_time_in_seconds") VALUES (?, ?)',
+                (f"{sample_day.isoformat()}T09:00:00", 1800),
+            )
+            conn.commit()
+
+            payload = strava_bridge.get_exercise_load(db_path)
+            self._assert_bridge_payload_shape(payload)
+            self.assertEqual(payload["total_load"], 30.0)
+        finally:
+            conn.close()
+            Path(db_path).unlink(missing_ok=True)
+
+    @unittest.skipUnless(REMOTE_BRIDGE_URL, "STRAVA_BRIDGE_REMOTE_URL not set")
     def test_mithril_docker_endpoint_is_available(self):
         try:
             with urllib.request.urlopen(REMOTE_BRIDGE_URL, timeout=5) as response:
@@ -237,7 +273,7 @@ class StravaBridgeApiTests(unittest.TestCase):
         self._assert_bridge_payload_shape(payload)
         self.assertGreaterEqual(payload["total_load"], 0.0)
         self.assertGreaterEqual(payload["total_activities"], 0)
-        self.assertTrue(any(day["load"] >= 0 for day in payload["days"]))
+        self.assertTrue(all(load >= 0 for _, load in payload["days"]))
 
     def test_unknown_route_returns_404(self):
         with _temp_activity_db() as (db_path, _, _):

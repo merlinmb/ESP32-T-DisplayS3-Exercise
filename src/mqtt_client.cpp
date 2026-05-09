@@ -1,6 +1,5 @@
 #include "mqtt_client.h"
 #include "screen_brightness.h"
-#include "rgb_led.h"
 #include "config.h"
 #include <PubSubClient.h>
 #include <WiFi.h>
@@ -18,6 +17,10 @@ static constexpr char kMqttDeviceName[] = "T-DisplayS3-StravaMonitor";
 static const uint32_t RECONNECT_INTERVAL_MS = 5000;
 static uint32_t s_last_reconnect_ms = 0;
 
+static bool mqtt_has_topic(const char *topic) {
+    return topic && topic[0] != '\0';
+}
+
 static bool mqtt_publish_stat(const char *suffix, const String &payload) {
     char topic[128];
     snprintf(topic, sizeof(topic), "stat/mcmddevices/%s", suffix);
@@ -29,9 +32,11 @@ static bool mqtt_publish_stat(const char *suffix, const String &payload) {
 }
 
 static void mqttTransmitInitStat(String deviceName) {
-    String payload = "{\"value1\":\"" + WiFi.localIP().toString() +
-                     "\",\"value2\":\"" + WiFi.macAddress() +
-                     "\",\"value3\":\"" + deviceName + "\"}";
+    String payload;
+    payload.reserve(128);
+    payload = "{\"value1\":\"" + WiFi.localIP().toString() +
+              "\",\"value2\":\"" + WiFi.macAddress() +
+              "\",\"value3\":\"" + deviceName + "\"}";
     mqtt_publish_stat("init", payload);
 }
 
@@ -42,6 +47,7 @@ static void mqttTransmitInitStat() {
 // ── Message handler ───────────────────────────────────────────────────────────
 
 static void on_message(const char *topic, byte *payload, unsigned int len) {
+    if (!s_cfg || !topic || !payload) return;
     if (len == 0 || len > 4) return; // 0-100 is at most 3 digits
 
     char buf[5];
@@ -53,23 +59,10 @@ static void on_message(const char *topic, byte *payload, unsigned int len) {
     if (raw > 100) raw = 100;
     uint8_t pct = (uint8_t)raw;
 
-    // Combined topic takes precedence — sets both LCD and LED
-    if (strcmp(topic, s_cfg->mqtt_combined_topic) == 0) {
-        Serial.printf("[MQTT] Combined brightness -> %d%%\n", pct);
-        s_cfg->brightness     = pct;
-        s_cfg->rgb_brightness = pct;
-        set_screen_brightness_pct(pct);
-        rgb_led_set_brightness_pct(pct);
-        s_save_pending = true; // defer NVS write out of the callback
-    } else if (strcmp(topic, s_cfg->mqtt_lcd_topic) == 0) {
+    if (mqtt_has_topic(s_cfg->mqtt_lcd_topic) && strcmp(topic, s_cfg->mqtt_lcd_topic) == 0) {
         Serial.printf("[MQTT] LCD brightness -> %d%%\n", pct);
         s_cfg->brightness = pct;
         set_screen_brightness_pct(pct);
-        s_save_pending = true;
-    } else if (strcmp(topic, s_cfg->mqtt_led_brightness_topic) == 0) {
-        Serial.printf("[MQTT] LED brightness -> %d%%\n", pct);
-        s_cfg->rgb_brightness = pct;
-        rgb_led_set_brightness_pct(pct);
         s_save_pending = true;
     }
 }
@@ -77,6 +70,7 @@ static void on_message(const char *topic, byte *payload, unsigned int len) {
 // ── Connection helper ─────────────────────────────────────────────────────────
 
 static bool try_connect() {
+    if (!s_cfg) return false;
     Serial.printf("[MQTT] Connecting to %s:%u ...\n",
                   s_cfg->mqtt_broker, s_cfg->mqtt_port);
     // Cap the blocking TCP connect to 3 s so loop() is not starved.
@@ -85,12 +79,12 @@ static bool try_connect() {
         Serial.printf("[MQTT] Failed, state=%d\n", s_mqtt.state());
         return false;
     }
-    s_mqtt.subscribe(s_cfg->mqtt_combined_topic);
-    s_mqtt.subscribe(s_cfg->mqtt_lcd_topic);
-    s_mqtt.subscribe(s_cfg->mqtt_led_brightness_topic);
-    Serial.printf("[MQTT] Connected. Subscribed to '%s', '%s', '%s'\n",
-                  s_cfg->mqtt_combined_topic, s_cfg->mqtt_lcd_topic,
-                  s_cfg->mqtt_led_brightness_topic);
+    if (mqtt_has_topic(s_cfg->mqtt_lcd_topic)) {
+        s_mqtt.subscribe(s_cfg->mqtt_lcd_topic);
+        Serial.printf("[MQTT] Connected. Subscribed to '%s'\n", s_cfg->mqtt_lcd_topic);
+    } else {
+        Serial.println("[MQTT] Connected. No topic configured");
+    }
     mqttTransmitInitStat();
     return true;
 }
@@ -125,7 +119,7 @@ void mqtt_client_reinit() {
 }
 
 void mqtt_client_tick() {
-    if (!s_enabled) return;
+    if (!s_enabled || !s_cfg) return;
 
     // Flush any config save requested by the message callback.
     if (s_save_pending) {

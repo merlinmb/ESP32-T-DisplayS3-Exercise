@@ -2,46 +2,60 @@
 #include "ui_fonts.h"
 #include <Arduino.h>
 
-#define GRID_WEEKS   53
-#define GRID_DAYS    7
 #define SCREEN_W     320
 #define SCREEN_H     170  // T-Display S3 landscape height (172 on the old C6 board)
-#define CELL_W       5
 #define CELL_H       12
-#define COL_GAP      1
+#define MIN_COL_GAP  1
 #define ROW_GAP      2
 #define FOOTER_H     28
-#define LEFT_PAD     3
+#define SIDE_PAD     3
 #define LABEL_FONT_H 18
 #define LABEL_GAP    6
 #define GRID_PIXEL_H ((GRID_DAYS * CELL_H) + ((GRID_DAYS - 1) * ROW_GAP))
 #define GRID_UNIT_H  (LABEL_FONT_H + LABEL_GAP + GRID_PIXEL_H)
 #define UNIT_TOP     ((SCREEN_H - FOOTER_H - GRID_UNIT_H) / 2)
 #define GRID_TOP     (UNIT_TOP + LABEL_FONT_H + LABEL_GAP)
-#define MONTH_LABEL_COUNT 6
+#define MONTH_SEP_OVERHANG 5
+#define MONTH_SEP_WIDTH    1
+#define MONTH_SEP_PAD      2
+#define MONTH_SEP_MASK_W   (MONTH_SEP_WIDTH + (MONTH_SEP_PAD * 2))
+#define MONTH_LABEL_COUNT kMaxHistoryMonths
 #define MONTH_SEP_COUNT   13  // max month boundaries in 53 weeks
 
 // Exercise load colour palette (matches strava_bridge thresholds)
 // Level 0 = no activity  1 = low (<50 min)  2 = medium (<100)  3 = high (<150)  4 = very high
 static const lv_color_t LEVEL_COLORS[5] = {
-    lv_color_hex(0x1e2228), // 0  grey  - no activity
+    lv_color_hex(0x171b20), // 0  grey  - no activity
     lv_color_hex(0x27ae60), // 1  green - low
     lv_color_hex(0xf39c12), // 2  amber - medium
     lv_color_hex(0xe67e22), // 3  orange - high
     lv_color_hex(0xe74c3c), // 4  red   - very high
 };
 static const lv_color_t LEVEL_BRIGHT[5] = {
-    lv_color_hex(0x1e2228), // 0  never animates
+    lv_color_hex(0x171b20), // 0  never animates
     lv_color_hex(0x2ecc71), // 1  bright green
     lv_color_hex(0xf1c40f), // 2  yellow
     lv_color_hex(0xf0932b), // 3  bright orange
     lv_color_hex(0xff5252), // 4  bright red
 };
 
+struct GridLayout {
+    int visible_weeks;
+    int grid_left;
+    int cell_w;
+    int col_gap;
+};
+
 static lv_obj_t *s_screen = nullptr;
 static lv_obj_t *s_cells[GRID_WEEKS][GRID_DAYS];
 static lv_obj_t *s_month_labels[MONTH_LABEL_COUNT];
 static lv_obj_t *s_month_seps[MONTH_SEP_COUNT];
+static GridLayout s_layout = {0, SIDE_PAD, 1, MIN_COL_GAP};
+
+struct MonthMarker {
+    int week;
+    int month;
+};
 
 // Store level per cell for animation callback lookup
 static uint8_t s_cell_levels[GRID_WEEKS][GRID_DAYS];
@@ -68,6 +82,96 @@ static void civil_from_days(int32_t days_since_epoch, int &year, int &month, int
     year += (month <= 2);
 }
 
+static int32_t days_from_civil(int year, unsigned month, unsigned day) {
+    year -= (int)(month <= 2);
+    const int era = (year >= 0 ? year : year - 399) / 400;
+    const unsigned yoe = (unsigned)(year - era * 400);
+    const unsigned doy = (153u * (month + (month > 2u ? (unsigned)-3 : 9u)) + 2u) / 5u + day - 1u;
+    const unsigned doe = yoe * 365u + yoe / 4u - yoe / 100u + doy;
+    return era * 146097 + (int)doe - 719468;
+}
+
+static uint8_t weekday_sun0(int32_t d) {
+    int w = (int)((d + 4) % 7);
+    if (w < 0) w += 7;
+    return (uint8_t)w;
+}
+
+static uint8_t clamp_history_months(uint8_t months) {
+    if (months < kMinHistoryMonths) return kDefaultHistoryMonths;
+    if (months > kMaxHistoryMonths) return kMaxHistoryMonths;
+    return months;
+}
+
+static int data_week_count(const StravaData &data) {
+    return (data.week_count > GRID_WEEKS) ? GRID_WEEKS : data.week_count;
+}
+
+static int approximate_visible_weeks(uint8_t history_months) {
+    int weeks = (int)((history_months * 31u + 6u) / 7u);
+    if (weeks < 1) weeks = 1;
+    if (weeks > GRID_WEEKS) weeks = GRID_WEEKS;
+    return weeks;
+}
+
+static void shift_months(int &year, int &month, int delta) {
+    month += delta;
+    while (month < 1) {
+        month += 12;
+        year--;
+    }
+    while (month > 12) {
+        month -= 12;
+        year++;
+    }
+}
+
+static int visible_week_count_for_history(const StravaData &data, uint8_t history_months) {
+    const int fallback_weeks = approximate_visible_weeks(history_months);
+    if (data.anchor_week_start_days == 0) return fallback_weeks;
+
+    int ref_year = 0;
+    int ref_month = 0;
+    int ref_day = 0;
+    int32_t ref_days = (data.latest_data_day_days != 0)
+        ? data.latest_data_day_days
+        : (data.anchor_week_start_days + 6);
+    civil_from_days(ref_days, ref_year, ref_month, ref_day);
+    shift_months(ref_year, ref_month, 1 - (int)history_months);
+
+    int32_t start_of_month = days_from_civil(ref_year, (unsigned)ref_month, 1);
+    int32_t first_visible_sunday = start_of_month - weekday_sun0(start_of_month);
+    int32_t delta_days = data.anchor_week_start_days - first_visible_sunday;
+    if (delta_days < 0) return fallback_weeks;
+
+    int weeks = (int)(delta_days / 7) + 1;
+    int available_weeks = data_week_count(data);
+    if (available_weeks > 0 && weeks > available_weeks) weeks = available_weeks;
+    if (weeks < 1) weeks = 1;
+    if (weeks > GRID_WEEKS) weeks = GRID_WEEKS;
+    return weeks;
+}
+
+static GridLayout build_grid_layout(const StravaData &data, const Config &cfg) {
+    GridLayout layout{};
+    layout.visible_weeks = visible_week_count_for_history(data, clamp_history_months(cfg.history_months));
+    layout.col_gap = MIN_COL_GAP;
+
+    int available_w = SCREEN_W - (SIDE_PAD * 2);
+    int total_gap_w = (layout.visible_weeks - 1) * layout.col_gap;
+    layout.cell_w = (available_w - total_gap_w) / layout.visible_weeks;
+    if (layout.cell_w < 1) layout.cell_w = 1;
+
+    int grid_pixel_w = layout.visible_weeks * layout.cell_w + total_gap_w;
+    layout.grid_left = SIDE_PAD + ((available_w - grid_pixel_w) / 2);
+    return layout;
+}
+
+static int first_visible_week_index(int total_weeks, int visible_weeks) {
+    if (visible_weeks >= total_weeks) return 0;
+    return total_weeks - visible_weeks;
+}
+
 static const char *month_abbr(int month) {
     static const char *MONTHS[12] = {
         "Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -77,52 +181,112 @@ static const char *month_abbr(int month) {
     return MONTHS[month - 1];
 }
 
-static void update_month_labels(const StravaData &data) {
-    static const uint8_t label_weeks[MONTH_LABEL_COUNT] = {2, 12, 22, 32, 42, 51};
-    static const char *fallback_months[MONTH_LABEL_COUNT] = {"", "", "", "", "", ""};
+static int collect_month_markers(const StravaData &data, const GridLayout &layout,
+                                 MonthMarker *markers, int max_markers) {
+    if (data.anchor_week_start_days == 0 || !markers || max_markers <= 0) return 0;
 
-    for (int i = 0; i < MONTH_LABEL_COUNT; i++) {
-        const char *text = fallback_months[i];
-        if (data.anchor_week_start_days != 0) {
-            int32_t week_start_days = data.anchor_week_start_days - (GRID_WEEKS - 1 - label_weeks[i]) * 7;
-            int year = 0;
-            int month = 0;
-            int day = 0;
-            civil_from_days(week_start_days + 3, year, month, day);
-            text = month_abbr(month);
+    int total_weeks = data_week_count(data);
+    if (total_weeks <= 0) total_weeks = GRID_WEEKS;
+    int start_week = first_visible_week_index(total_weeks, layout.visible_weeks);
+
+    int marker_count = 0;
+    int prev_month = -1;
+    for (int visible_w = 0; visible_w < layout.visible_weeks && marker_count < max_markers; visible_w++) {
+        int data_week = start_week + visible_w;
+        int32_t week_sun = data.anchor_week_start_days - (total_weeks - 1 - data_week) * 7;
+        int year = 0;
+        int month = 0;
+        int day = 0;
+        civil_from_days(week_sun + 3, year, month, day); // midweek sample
+        if (month != prev_month) {
+            markers[marker_count].week = visible_w;
+            markers[marker_count].month = month;
+            marker_count++;
+            prev_month = month;
         }
+    }
 
-        lv_label_set_text(s_month_labels[i], text);
-        int x = LEFT_PAD + label_weeks[i] * (CELL_W + COL_GAP);
-        lv_obj_set_pos(s_month_labels[i], x, UNIT_TOP);
+    return marker_count;
+}
+
+static void apply_grid_layout(const GridLayout &layout) {
+    s_layout = layout;
+
+    for (int w = 0; w < GRID_WEEKS; w++) {
+        bool visible = (w < layout.visible_weeks);
+        for (int d = 0; d < GRID_DAYS; d++) {
+            if (!s_cells[w][d]) continue;
+
+            if (!visible) {
+                lv_obj_add_flag(s_cells[w][d], LV_OBJ_FLAG_HIDDEN);
+                continue;
+            }
+
+            int x = layout.grid_left + w * (layout.cell_w + layout.col_gap);
+            int y = GRID_TOP + d * (CELL_H + ROW_GAP);
+            lv_obj_set_size(s_cells[w][d], layout.cell_w, CELL_H);
+            lv_obj_set_pos(s_cells[w][d], x, y);
+            lv_obj_clear_flag(s_cells[w][d], LV_OBJ_FLAG_HIDDEN);
+        }
     }
 }
 
-static void update_month_separators(const StravaData &data) {
-    // Hide all separators first
+static void update_month_labels(const StravaData &data, const Config &cfg, const GridLayout &layout) {
+    for (int i = 0; i < MONTH_LABEL_COUNT; i++) {
+        if (!s_month_labels[i]) continue;
+        lv_label_set_text(s_month_labels[i], "");
+        lv_obj_add_flag(s_month_labels[i], LV_OBJ_FLAG_HIDDEN);
+    }
+
+    MonthMarker markers[MONTH_SEP_COUNT];
+    int marker_count = collect_month_markers(data, layout, markers, MONTH_SEP_COUNT);
+    if (marker_count <= 0) return;
+
+    int label_count = clamp_history_months(cfg.history_months);
+    if (label_count > marker_count) label_count = marker_count;
+    if (label_count < 1) label_count = 1;
+
+    for (int i = 0; i < label_count; i++) {
+        int marker_idx = i;
+        if (marker_count > label_count && label_count > 1) {
+            marker_idx = (i * (marker_count - 1) + (label_count - 1) / 2) / (label_count - 1);
+        }
+
+        const char *text = month_abbr(markers[marker_idx].month);
+        int marker_x = layout.grid_left + markers[marker_idx].week * (layout.cell_w + layout.col_gap);
+
+        lv_label_set_text(s_month_labels[i], text);
+        lv_obj_update_layout(s_month_labels[i]);
+
+        int x = marker_x - (MONTH_SEP_MASK_W / 2);
+        if (markers[marker_idx].week == 0 && x < layout.grid_left) x = layout.grid_left;
+        if (x < 0) x = 0;
+        int max_x = SCREEN_W - lv_obj_get_width(s_month_labels[i]);
+        if (x > max_x) x = max_x;
+
+        lv_obj_set_pos(s_month_labels[i], x, UNIT_TOP);
+        lv_obj_clear_flag(s_month_labels[i], LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void update_month_separators(const StravaData &data, const GridLayout &layout) {
     for (int i = 0; i < MONTH_SEP_COUNT; i++) {
         if (s_month_seps[i]) lv_obj_add_flag(s_month_seps[i], LV_OBJ_FLAG_HIDDEN);
     }
     if (data.anchor_week_start_days == 0) return;
 
-    int sep_idx = 0;
-    int prev_month = -1;
-    for (int w = 0; w < GRID_WEEKS && sep_idx < MONTH_SEP_COUNT; w++) {
-        int32_t week_sun = data.anchor_week_start_days - (GRID_WEEKS - 1 - w) * 7;
-        int year, month, day;
-        civil_from_days(week_sun + 3, year, month, day); // midweek sample
-        if (month != prev_month && prev_month != -1) {
-            // Draw separator in the gap just before this column
-            int x = LEFT_PAD + w * (CELL_W + COL_GAP) - 1;
-            lv_obj_set_pos(s_month_seps[sep_idx], x, GRID_TOP);
-            lv_obj_clear_flag(s_month_seps[sep_idx], LV_OBJ_FLAG_HIDDEN);
-            sep_idx++;
-        }
-        prev_month = month;
+    MonthMarker markers[MONTH_SEP_COUNT];
+    int marker_count = collect_month_markers(data, layout, markers, MONTH_SEP_COUNT);
+    for (int marker_idx = 1; marker_idx < marker_count; marker_idx++) {
+        int x = layout.grid_left + markers[marker_idx].week * (layout.cell_w + layout.col_gap) - (MONTH_SEP_MASK_W / 2);
+        lv_obj_set_pos(s_month_seps[marker_idx - 1], x, GRID_TOP - MONTH_SEP_OVERHANG);
+        lv_obj_clear_flag(s_month_seps[marker_idx - 1], LV_OBJ_FLAG_HIDDEN);
     }
 }
 
-lv_obj_t *display_grid_build(const char *title) {
+lv_obj_t *display_grid_build(const char *title, const Config &cfg) {
+    GridLayout initial_layout = build_grid_layout(StravaData{}, cfg);
+
     memset(s_cells, 0, sizeof(s_cells));
     memset(s_cell_levels, 0, sizeof(s_cell_levels));
     memset(s_month_labels, 0, sizeof(s_month_labels));
@@ -141,18 +305,17 @@ lv_obj_t *display_grid_build(const char *title) {
         lv_obj_set_style_text_font(lbl, ui_font_label(), 0);
         lv_obj_set_style_text_color(lbl, label_color, 0);
         lv_label_set_text(lbl, "");
-        lv_obj_set_pos(lbl, LEFT_PAD, UNIT_TOP);
+        lv_obj_set_pos(lbl, initial_layout.grid_left, UNIT_TOP);
+        lv_obj_add_flag(lbl, LV_OBJ_FLAG_HIDDEN);
         s_month_labels[i] = lbl;
     }
 
-    update_month_labels(StravaData{});
-
-    // Grid cells: 53 columns x 7 rows
+    // Grid cells: visible columns are resized/repositioned at update time.
     for (int w = 0; w < GRID_WEEKS; w++) {
         for (int d = 0; d < GRID_DAYS; d++) {
             lv_obj_t *cell = lv_obj_create(s_screen);
             lv_obj_remove_style_all(cell);
-            lv_obj_set_size(cell, CELL_W, CELL_H);
+            lv_obj_set_size(cell, initial_layout.cell_w, CELL_H);
             lv_obj_set_style_radius(cell, 1, 0);
             lv_obj_set_style_border_width(cell, 0, 0);
             lv_obj_set_style_pad_all(cell, 0, 0);
@@ -160,27 +323,36 @@ lv_obj_t *display_grid_build(const char *title) {
             lv_obj_set_style_bg_opa(cell, LV_OPA_COVER, 0);
             lv_obj_clear_flag(cell, LV_OBJ_FLAG_SCROLLABLE);
             lv_obj_set_user_data(cell, (void *)(uintptr_t)0);
-            int x = LEFT_PAD + w * (CELL_W + COL_GAP);
-            int y = GRID_TOP  + d * (CELL_H + ROW_GAP);
-            lv_obj_set_pos(cell, x, y);
             s_cells[w][d] = cell;
             s_cell_levels[w][d] = 0;
         }
     }
 
-    // Month separator lines — 1px wide, full grid height, light grey
+    // Month separator lines — 1px wide, extend slightly past the grid, soft grey
     for (int i = 0; i < MONTH_SEP_COUNT; i++) {
-        lv_obj_t *sep = lv_obj_create(s_screen);
-        lv_obj_remove_style_all(sep);
-        lv_obj_set_size(sep, 1, GRID_PIXEL_H);
-        lv_obj_set_style_bg_color(sep, lv_color_hex(0x444c56), 0);
-        lv_obj_set_style_bg_opa(sep, LV_OPA_COVER, 0);
-        lv_obj_set_pos(sep, 0, GRID_TOP);
-        lv_obj_add_flag(sep, LV_OBJ_FLAG_HIDDEN);
-        s_month_seps[i] = sep;
+        lv_obj_t *sep_mask = lv_obj_create(s_screen);
+        lv_obj_remove_style_all(sep_mask);
+        lv_obj_set_size(sep_mask, MONTH_SEP_MASK_W, GRID_PIXEL_H + (MONTH_SEP_OVERHANG * 2));
+        lv_obj_set_style_bg_color(sep_mask, lv_color_black(), 0);
+        lv_obj_set_style_bg_opa(sep_mask, LV_OPA_COVER, 0);
+        lv_obj_set_pos(sep_mask, 0, GRID_TOP - MONTH_SEP_OVERHANG);
+        lv_obj_add_flag(sep_mask, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(sep_mask, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *sep_line = lv_obj_create(sep_mask);
+        lv_obj_remove_style_all(sep_line);
+        lv_obj_set_size(sep_line, MONTH_SEP_WIDTH, GRID_PIXEL_H + (MONTH_SEP_OVERHANG * 2));
+        lv_obj_set_style_bg_color(sep_line, lv_color_hex(0xB3B3B3), 0);
+        lv_obj_set_style_bg_opa(sep_line, LV_OPA_COVER, 0);
+        lv_obj_set_pos(sep_line, MONTH_SEP_PAD, 0);
+        lv_obj_clear_flag(sep_line, LV_OBJ_FLAG_SCROLLABLE);
+
+        s_month_seps[i] = sep_mask;
     }
 
-    update_month_separators(StravaData{});
+    apply_grid_layout(initial_layout);
+    update_month_labels(StravaData{}, cfg, initial_layout);
+    update_month_separators(StravaData{}, initial_layout);
 
     // Footer container
     lv_obj_t *footer = lv_obj_create(s_screen);
@@ -197,7 +369,7 @@ lv_obj_t *display_grid_build(const char *title) {
     lv_obj_set_style_text_font(user_lbl, ui_font_label(), 0);
     lv_obj_set_style_text_color(user_lbl, lv_color_hex(0xfc4c02), 0); // Strava orange
     lv_label_set_text(user_lbl, title ? title : "Exercise Load");
-    lv_obj_align(user_lbl, LV_ALIGN_LEFT_MID, LEFT_PAD, 0);
+    lv_obj_align(user_lbl, LV_ALIGN_LEFT_MID, SIDE_PAD, 0);
 
     // Legend: 5 squares right-aligned, then "More" label
     // Build right-to-left: "More" label, then squares
@@ -205,14 +377,14 @@ lv_obj_t *display_grid_build(const char *title) {
     lv_obj_set_style_text_font(more_lbl, ui_font_label(), 0);
     lv_obj_set_style_text_color(more_lbl, label_color, 0);
     lv_label_set_text(more_lbl, "More");
-    lv_obj_align(more_lbl, LV_ALIGN_RIGHT_MID, -LEFT_PAD, 0);
+    lv_obj_align(more_lbl, LV_ALIGN_RIGHT_MID, -SIDE_PAD, 0);
 
     // Place squares left of "More" label
     // Each square is 5px wide + 2px gap
     for (int i = 4; i >= 0; i--) {
         lv_obj_t *sq = lv_obj_create(footer);
         lv_obj_remove_style_all(sq);
-        lv_obj_set_size(sq, CELL_W, CELL_H);
+        lv_obj_set_size(sq, 5, CELL_H);
         lv_obj_set_style_radius(sq, 1, 0);
         lv_obj_set_style_border_width(sq, 0, 0);
         lv_obj_set_style_pad_all(sq, 0, 0);
@@ -221,8 +393,8 @@ lv_obj_t *display_grid_build(const char *title) {
         // Position: right edge of "More" text minus offset per square
         // "More" text ~24px wide, right edge at 320-8=312, so More starts at ~288
         // squares at: 288 - 2(gap) - 5(sq) = 281, then 281-7=274, etc.
-        int x_right = SCREEN_W - LEFT_PAD - 40; // approximate left edge of the larger "More" label
-        int sq_x = x_right - (4 - i + 1) * (CELL_W + 2);
+        int x_right = SCREEN_W - SIDE_PAD - 40; // approximate left edge of the larger "More" label
+        int sq_x = x_right - (4 - i + 1) * (5 + 2);
         lv_obj_set_pos(sq, sq_x, (FOOTER_H - CELL_H) / 2);
     }
 
@@ -251,19 +423,26 @@ void display_grid_update(const StravaData &data, const Config &cfg) {
                   (int)data.valid, (int)data.week_count, (long)data.anchor_week_start_days);
 
     display_grid_stop_animations();
-    update_month_labels(data);
-    update_month_separators(data);
+    GridLayout layout = build_grid_layout(data, cfg);
+    apply_grid_layout(layout);
+    update_month_labels(data, cfg, layout);
+    update_month_separators(data, layout);
+
+    const int total_weeks = data_week_count(data);
+    const int first_week = first_visible_week_index(total_weeks, layout.visible_weeks);
+    const int week_count = (total_weeks > layout.visible_weeks) ? layout.visible_weeks : total_weeks;
 
     // Collect non-zero loads to compute percentile threshold for animation
     float loads[GRID_WEEKS * GRID_DAYS];
     int load_n = 0;
-    for (int w = 0; w < (int)data.week_count; w++) {
+    for (int w = 0; w < week_count; w++) {
+        int data_w = first_week + w;
         for (int d = 0; d < GRID_DAYS; d++) {
-            if (data.days[w][d].load > 0.0f)
-                loads[load_n++] = data.days[w][d].load;
+            if (data.days[data_w][d].load > 0.0f)
+                loads[load_n++] = data.days[data_w][d].load;
         }
     }
-    Serial.printf("[Grid] active days=%d, week_count=%d\n", load_n, (int)data.week_count);
+    Serial.printf("[Grid] active days=%d, visible_weeks=%d\n", load_n, layout.visible_weeks);
 
     // Insertion sort ascending (max 371 items)
     for (int i = 1; i < load_n; i++) {
@@ -282,18 +461,18 @@ void display_grid_update(const StravaData &data, const Config &cfg) {
         if (threshold <= 0.0f) threshold = 1.0f;
     }
 
-    const int week_count = (data.week_count > GRID_WEEKS) ? GRID_WEEKS : data.week_count;
-
     int cells_colored = 0;
     for (int display_w = 0; display_w < GRID_WEEKS; display_w++) {
         for (int d = 0; d < GRID_DAYS; d++) {
-            float   ld  = (display_w < week_count) ? data.days[display_w][d].load  : 0.0f;
-            uint8_t lvl = (display_w < week_count) ? data.days[display_w][d].level : 0;
+            int data_w = first_week + display_w;
+            bool in_range = (display_w < layout.visible_weeks) && (display_w < week_count);
+            float   ld  = in_range ? data.days[data_w][d].load  : 0.0f;
+            uint8_t lvl = in_range ? data.days[data_w][d].level : 0;
             s_cell_levels[display_w][d] = lvl;
 
             lv_obj_set_user_data(s_cells[display_w][d], (void *)(uintptr_t)lvl);
             lv_obj_set_style_bg_color(s_cells[display_w][d], LEVEL_COLORS[lvl], 0);
-            if (lvl > 0) cells_colored++;
+            if (lvl > 0 && display_w < layout.visible_weeks) cells_colored++;
 
             if (ld > 0.0f && ld >= threshold) {
                 lv_anim_t a;
@@ -311,5 +490,5 @@ void display_grid_update(const StravaData &data, const Config &cfg) {
         }
     }
     Serial.printf("[Grid] cells_colored=%d (lvl>0) out of %d total\n",
-                  cells_colored, GRID_WEEKS * GRID_DAYS);
+                  cells_colored, layout.visible_weeks * GRID_DAYS);
 }
