@@ -10,7 +10,7 @@ static ConfigApplyFn  s_apply_fn = nullptr;
 // Build config page HTML string with current values pre-filled
 static String build_page() {
     bool ap_mode = (WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA);
-    String ip = ap_mode ? "192.168.4.1" : WiFi.localIP().toString();
+    String ip = ap_mode ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
 
     String html;
     html.reserve(4096);
@@ -18,11 +18,11 @@ static String build_page() {
     html += F("<!DOCTYPE html><html lang='en'><head>"
               "<meta charset='UTF-8'>"
               "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-              "<title>GitHub Monitor Config</title>"
+              "<title>Strava Monitor Config</title>"
               "<style>"
               "*{box-sizing:border-box;margin:0;padding:0}"
               "body{background:#0d1117;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:20px}"
-              "h1{color:#39d353;font-size:20px;margin-bottom:4px}"
+              "h1{color:#fc4c02;font-size:20px;margin-bottom:4px}"
               ".sub{color:#8b949e;font-size:13px;margin-bottom:24px}"
               ".warn{color:#d29922;font-size:12px;margin-left:8px}"
               ".card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:20px;margin-bottom:16px}"
@@ -52,10 +52,14 @@ static String build_page() {
               "font-size:14px;opacity:0;transition:opacity .3s,transform .3s;"
               "pointer-events:none;z-index:999}"
               "</style></head><body>"
-              "<h1>GitHub Monitor</h1>"
+              "<h1>Strava Exercise Monitor</h1>"
               "<div class='sub'>Device IP: ");
     html += ip;
-    if (ap_mode) html += F(" <span class='warn'>&#9888; Setup mode — connect to GithubMonitor-Setup then visit 192.168.4.1</span>");
+    if (ap_mode) {
+        html += F(" <span class='warn'>&#9888; Setup mode — connect to ");
+        html += kSetupApSsid;
+        html += F(" then visit 192.168.4.1</span>");
+    }
     html += F("</div><form id='cfg'>");
 
     // WiFi card
@@ -68,14 +72,11 @@ static String build_page() {
     html += s_cfg->wifi_password;
     html += F("'></div>");
 
-    // GitHub card
-    html += F("<div class='card'><h2>GitHub</h2>"
-              "<label>Username</label>"
-              "<input type='text' name='gh_user' value='");
-    html += s_cfg->github_username;
-    html += F("'><label>Personal Access Token (read:user scope)</label>"
-              "<input type='password' name='gh_token' value='");
-    html += s_cfg->github_token;
+    // Strava bridge card
+    html += F("<div class='card'><h2>Strava Bridge</h2>"
+              "<label>Bridge server URL (strava_bridge.py endpoint)</label>"
+              "<input type='text' name='srv_url' placeholder='http://192.168.1.54:8082/api/exercise-load' value='");
+    html += s_cfg->strava_server_url;
     html += F("'></div>");
 
     // Display card
@@ -126,13 +127,13 @@ static String build_page() {
               "<span class='range-val'>");
     html += s_cfg->rgb_brightness;
     html += F("%</span></div>"
-              "<label>Min breath period ms (fastest, high streak)</label>"
+              "<label>Min breath period ms (fastest, at max load)</label>"
               "<input type='number' name='rgb_pmin' min='400' max='4000' value='");
     html += s_cfg->rgb_period_min_ms;
-    html += F("'><label>Max breath period ms (slowest, no streak)</label>"
+    html += F("'><label>Max breath period ms (slowest, no activity)</label>"
               "<input type='number' name='rgb_pmax' min='2000' max='20000' value='");
     html += s_cfg->rgb_period_max_ms;
-    html += F("'><label>Streak max (streak that achieves min period)</label>"
+    html += F("'><label>Load target (minutes that achieves max LED speed)</label>"
               "<input type='number' name='rgb_smax' min='1' max='365' value='");
     html += s_cfg->rgb_streak_max;
     html += F("'></div>");
@@ -211,10 +212,9 @@ static void handle_save() {
         }
     };
 
-    get_str("wifi_ssid", s_cfg->wifi_ssid,       sizeof(s_cfg->wifi_ssid));
-    get_str("wifi_pass", s_cfg->wifi_password,    sizeof(s_cfg->wifi_password));
-    get_str("gh_user",   s_cfg->github_username,  sizeof(s_cfg->github_username));
-    get_str("gh_token",  s_cfg->github_token,     sizeof(s_cfg->github_token));
+    get_str("wifi_ssid", s_cfg->wifi_ssid,          sizeof(s_cfg->wifi_ssid));
+    get_str("wifi_pass", s_cfg->wifi_password,      sizeof(s_cfg->wifi_password));
+    get_str("srv_url",   s_cfg->strava_server_url,  sizeof(s_cfg->strava_server_url));
 
     if (server.hasArg("brightness"))  s_cfg->brightness           = (uint8_t) server.arg("brightness").toInt();
     if (server.hasArg("switch_sec"))  s_cfg->screen_switch_secs   = (uint16_t)server.arg("switch_sec").toInt();
@@ -237,7 +237,7 @@ static void handle_save() {
     if (s_apply_fn) s_apply_fn(*s_cfg);
 
     server.send(200, "application/json",
-        "{\"ok\":true,\"msg\":\"Saved. WiFi & GitHub changes need a reboot.\"}");
+        "{\"ok\":true,\"msg\":\"Saved. WiFi and URL changes need a reboot.\"}");
 }
 
 static void handle_reboot() {
@@ -269,8 +269,10 @@ void web_server_start(Config &cfg, ConfigApplyFn on_apply) {
     server.on("/reboot", HTTP_POST, handle_reboot);
     server.on("/reset",  HTTP_POST, handle_reset);
     server.begin();
-    Serial.printf("[Web] Server started at http://%s/\n",
-                  WiFi.localIP().toString().c_str());
+    IPAddress web_ip = (WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA)
+        ? WiFi.softAPIP()
+        : WiFi.localIP();
+    Serial.printf("[Web] Server started at http://%s/\n", web_ip.toString().c_str());
 }
 
 void web_server_handle() {

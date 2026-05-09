@@ -1,13 +1,13 @@
-// GitHub Contributions Monitor
-// ESP32-C6 + ST7789 172x320 IPS display, LVGL v9
+// Strava Exercise Load Monitor
+// LilyGo T-Display S3 + ST7789V 170x320 IPS display, LVGL v9
 
 #include <WiFi.h>
 #include <Arduino.h>
 #include <lvgl.h>
-#include "PINS_ESP32-C6-LCD-1_47.h"
+#include "PINS_T_DISPLAY_S3.h"
 #include "secrets.h"
 #include "config.h"
-#include "github_api.h"
+#include "strava_api.h"
 #include "display_grid.h"
 #include "display_stats.h"
 #include "web_server.h"
@@ -17,13 +17,14 @@
 #include "mqtt_client.h"
 
 static Config     g_cfg;
-static GithubData g_data;
+static StravaData g_data;
 static lv_obj_t  *g_screen_grid  = nullptr;
 static lv_obj_t  *g_screen_stats = nullptr;
 static bool       g_show_grid    = true;
 static bool       g_display_ready = false;
 static uint32_t   g_last_fetch_ms = 0;
 static lv_display_t *disp = nullptr;
+static lv_color_t *g_lvgl_buf = nullptr;
 
 static void style_active_screen_black() {
     lv_obj_t *screen = lv_scr_act();
@@ -66,7 +67,7 @@ void set_screen_brightness_pct(uint8_t pct) {
 }
 
 // ── Screen switch timer ───────────────────────────────────────────────────────
-// Grid stays visible 3× longer than stats to give the contribution view priority.
+// Grid stays visible 3x longer than stats to give the activity view priority.
 
 static lv_timer_t *g_screen_switch_timer = nullptr;
 
@@ -85,30 +86,34 @@ static void screen_switch_cb(lv_timer_t *t) {
 
 // ── Async data refresh via FreeRTOS task ──────────────────────────────────────
 
-static const uint32_t FETCH_TIMEOUT_MS  = 30000; // hard kill if task hangs
+static const uint32_t FETCH_TIMEOUT_MS  = 35000; // abort flag set after this long
 static const int      FETCH_MAX_RETRIES = 3;
 static const uint32_t FETCH_RETRY_MS    = 5000;
 
-// State shared between main loop and fetch task — written only by the task,
-// read only by the main loop (after task exits), so no mutex needed.
+// State shared between main loop and fetch task.
+// g_fetch_abort is written by the main loop and read by the task; volatile is
+// sufficient because it is only ever set true (no torn read/write issue).
 enum FetchState { FETCH_IDLE, FETCH_RUNNING, FETCH_DONE_OK, FETCH_DONE_FAIL };
 static volatile FetchState g_fetch_state = FETCH_IDLE;
-static GithubData          g_fetch_result; // scratch buffer written by task
-static TaskHandle_t        g_fetch_task   = nullptr;
+static volatile bool       g_fetch_abort = false; // ask task to stop early
+static StravaData          g_fetch_result;
+static TaskHandle_t        g_fetch_task  = nullptr;
 
 static void fetch_task(void *) {
     bool ok = false;
-    for (int attempt = 1; attempt <= FETCH_MAX_RETRIES; attempt++) {
+    for (int attempt = 1; attempt <= FETCH_MAX_RETRIES && !g_fetch_abort; attempt++) {
         Serial.printf("[Fetch] Attempt %d/%d\n", attempt, FETCH_MAX_RETRIES);
-        ok = github_fetch(g_cfg.github_username, g_cfg.github_token, g_fetch_result);
+        ok = strava_fetch(g_cfg.strava_server_url, g_fetch_result);
         if (ok) break;
-        if (attempt < FETCH_MAX_RETRIES) {
+        if (attempt < FETCH_MAX_RETRIES && !g_fetch_abort) {
             Serial.printf("[Fetch] Failed, retrying in %u ms...\n", FETCH_RETRY_MS);
-            vTaskDelay(pdMS_TO_TICKS(FETCH_RETRY_MS));
+            // Sleep in small increments so we notice the abort flag promptly.
+            for (uint32_t slept = 0; slept < FETCH_RETRY_MS && !g_fetch_abort; slept += 100)
+                vTaskDelay(pdMS_TO_TICKS(100));
         }
     }
-    __asm__ volatile("" ::: "memory"); // ensure g_fetch_result writes are visible before state change
-    g_fetch_state = ok ? FETCH_DONE_OK : FETCH_DONE_FAIL;
+    __asm__ volatile("" ::: "memory");
+    g_fetch_state = (ok && !g_fetch_abort) ? FETCH_DONE_OK : FETCH_DONE_FAIL;
     g_fetch_task  = nullptr;
     vTaskDelete(nullptr);
 }
@@ -133,9 +138,10 @@ static void apply_fetch_result(bool ok) {
 static void do_fetch() {
     if (g_fetch_state == FETCH_RUNNING) return;
     display_grid_stop_animations();
-    g_fetch_state = FETCH_RUNNING;
+    g_fetch_abort  = false;
+    g_fetch_state  = FETCH_RUNNING;
     memset(&g_fetch_result, 0, sizeof(g_fetch_result));
-    xTaskCreate(fetch_task, "gh_fetch", 12288, nullptr, 1, &g_fetch_task);
+    xTaskCreate(fetch_task, "strava_fetch", 12288, nullptr, 1, &g_fetch_task);
 }
 
 // Called every loop iteration — checks if the fetch task finished or timed out.
@@ -144,23 +150,29 @@ static void fetch_tick() {
     if (g_fetch_state == FETCH_IDLE) return;
 
     if (g_fetch_state == FETCH_RUNNING) {
-        // Record when we started (first tick after RUNNING is set); avoid 0 sentinel
-        if (g_fetch_started_ms == 0) {
-            uint32_t t = millis();
-            g_fetch_started_ms = t ? t : 1;
-        }
+        if (g_fetch_started_ms == 0)
+            g_fetch_started_ms = millis() | 1u; // |1 avoids the 0 sentinel without a branch
 
-        // Hard timeout: kill the task if it's been stuck too long
         if (millis() - g_fetch_started_ms >= FETCH_TIMEOUT_MS) {
-            Serial.println("[Fetch] Timeout — killing stuck task");
-            if (g_fetch_task) { vTaskDelete(g_fetch_task); g_fetch_task = nullptr; }
-            g_fetch_state     = FETCH_DONE_FAIL;
+            Serial.println("[Fetch] Timeout — requesting abort");
+            g_fetch_abort = true;
+            // Give the task up to 3 s to see the flag and exit cleanly.
+            // If it still hasn't stopped, force-delete as a last resort.
+            uint32_t wait_start = millis();
+            while (g_fetch_task && (millis() - wait_start < 3000))
+                delay(50);
+            if (g_fetch_task) {
+                Serial.println("[Fetch] Force-killing stuck task");
+                vTaskDelete(g_fetch_task);
+                g_fetch_task = nullptr;
+            }
+            g_fetch_state      = FETCH_DONE_FAIL;
             g_fetch_started_ms = 0;
         }
         return;
     }
 
-    // Task finished
+    // Task finished normally
     g_fetch_started_ms = 0;
     bool ok = (g_fetch_state == FETCH_DONE_OK);
     g_fetch_state = FETCH_IDLE;
@@ -220,7 +232,7 @@ static void wifi_connect_splash() {
 
 // ── AP mode splash (first boot, no creds in NVS) ─────────────────────────────
 
-static void ap_mode_splash() {
+static void ap_mode_splash(const char *ap_ssid) {
     style_active_screen_black();
 
     lv_obj_t *lbl = lv_label_create(lv_scr_act());
@@ -229,12 +241,13 @@ static void ap_mode_splash() {
     lv_obj_set_width(lbl, 300);
     lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
-    lv_label_set_text(lbl,
+    lv_label_set_text_fmt(lbl,
         "Setup mode\n"
         "Connect Wi-Fi to:\n"
-        "GithubMonitor-Setup\n"
+        "%s\n"
         "Then open:\n"
-        "http://192.168.4.1");
+        "http://192.168.4.1",
+        ap_ssid);
     lv_obj_align(lbl, LV_ALIGN_CENTER, 0, 0);
 }
 
@@ -248,16 +261,25 @@ static void lvgl_init() {
 #endif
     uint32_t w = gfx->width();
     uint32_t h = gfx->height();
-    uint32_t buf_size = w * 40;
+    uint32_t buf_lines = 24;
+    uint32_t buf_size = w * buf_lines;
 
-    lv_color_t *buf = (lv_color_t *)heap_caps_malloc(buf_size * 2,
-                       MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (!buf) buf = (lv_color_t *)heap_caps_malloc(buf_size * 2, MALLOC_CAP_8BIT);
-    if (!buf) { Serial.println("LVGL buf alloc failed!"); while (true); }
+    g_lvgl_buf = (lv_color_t *)heap_caps_malloc(buf_size * sizeof(lv_color_t),
+                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!g_lvgl_buf) {
+        buf_lines = 12;
+        buf_size = w * buf_lines;
+        g_lvgl_buf = (lv_color_t *)heap_caps_malloc(buf_size * sizeof(lv_color_t),
+                     MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (!g_lvgl_buf) {
+        g_lvgl_buf = (lv_color_t *)heap_caps_malloc(buf_size * sizeof(lv_color_t), MALLOC_CAP_8BIT);
+    }
+    if (!g_lvgl_buf) { Serial.println("LVGL buf alloc failed!"); while (true); }
 
     disp = lv_display_create(w, h);
     lv_display_set_flush_cb(disp, my_disp_flush);
-    lv_display_set_buffers(disp, buf, NULL, buf_size * 2, LV_DISPLAY_RENDER_MODE_PARTIAL);
+    lv_display_set_buffers(disp, g_lvgl_buf, NULL, buf_size * sizeof(lv_color_t), LV_DISPLAY_RENDER_MODE_PARTIAL);
     style_active_screen_black();
 }
 
@@ -269,7 +291,7 @@ void setup() {
     delay(2000);
 
     if (!gfx->begin()) { Serial.println("GFX init failed!"); while (true); }
-    gfx->setRotation(1); // landscape: 320x172 (pre-config default)
+    gfx->setRotation(1); // landscape: 320x170 (pre-config default)
     gfx->fillScreen(RGB565_BLACK);
     set_screen_brightness_pct(100); // full brightness during splash
 
@@ -284,9 +306,15 @@ void setup() {
     if (g_cfg.wifi_ssid[0] == '\0') {
         // No WiFi creds in NVS — start AP setup mode
         WiFi.mode(WIFI_AP);
-        WiFi.softAP("GithubMonitor-Setup", nullptr, 6, false, 4);
-        Serial.println("[WiFi] AP mode: GithubMonitor-Setup @ 192.168.4.1");
-        ap_mode_splash();
+        bool ap_started = WiFi.softAP(kSetupApSsid, nullptr, 6, false, 4);
+        if (!ap_started) {
+            Serial.println("[WiFi] AP start failed");
+        } else {
+            Serial.printf("[WiFi] AP mode: %s @ %s\n",
+                          kSetupApSsid,
+                          WiFi.softAPIP().toString().c_str());
+        }
+        ap_mode_splash(kSetupApSsid);
         web_server_start(g_cfg, [](const Config &cfg) {
             gfx->setRotation(cfg.flip_screen ? 3 : 1);
             set_screen_brightness_pct(cfg.brightness);
@@ -310,8 +338,8 @@ void setup() {
     });
     mqtt_client_init(g_cfg);
 
-    g_screen_grid  = display_grid_build(g_cfg.github_username);
-    g_screen_stats = display_stats_build(g_cfg.github_username);
+    g_screen_grid  = display_grid_build("Exercise Load");
+    g_screen_stats = display_stats_build("Exercise Load");
     g_display_ready = (g_screen_grid != nullptr && g_screen_stats != nullptr);
 
     lv_scr_load(g_screen_grid ? g_screen_grid : lv_scr_act());
@@ -349,6 +377,9 @@ static void wifi_watchdog_tick() {
         return;
     }
     if (now - g_wifi_lost_ms >= WIFI_RECONNECT_MS) {
+        // Don't tear down the radio while a fetch task is mid-TLS handshake —
+        // that would leave the socket in an unrecoverable state.
+        if (g_fetch_state == FETCH_RUNNING) return;
         Serial.println("[WiFi] Reconnecting...");
         WiFi.reconnect();
         g_wifi_lost_ms = now; // reset timer so we don't spam reconnect

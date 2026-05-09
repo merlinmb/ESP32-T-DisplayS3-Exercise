@@ -2,8 +2,14 @@ build
 .vscode
 include/secrets.h
 .superpowers/
-secrets
+secrets/
 secrets.txt
+
+# Python local environment and generated files
+.venv/
+__pycache__/
+*.pyc
+*.pyo
 
 # PlatformIO — auto-generated, do not commit
 # Build artefacts and toolchain cache

@@ -5,7 +5,7 @@
 #define GRID_WEEKS   53
 #define GRID_DAYS    7
 #define SCREEN_W     320
-#define SCREEN_H     172
+#define SCREEN_H     170  // T-Display S3 landscape height (172 on the old C6 board)
 #define CELL_W       5
 #define CELL_H       12
 #define COL_GAP      1
@@ -20,20 +20,21 @@
 #define GRID_TOP     (UNIT_TOP + LABEL_FONT_H + LABEL_GAP)
 #define MONTH_LABEL_COUNT 6
 
-// Colour table: level 0-4 (normal and bright/peak for animation)
+// Exercise load colour palette (matches strava_bridge thresholds)
+// Level 0 = no activity  1 = low (<50 min)  2 = medium (<100)  3 = high (<150)  4 = very high
 static const lv_color_t LEVEL_COLORS[5] = {
-    lv_color_hex(0x161b22),
-    lv_color_hex(0x2b8a4f),
-    lv_color_hex(0x48c765),
-    lv_color_hex(0x56d364),
-    lv_color_hex(0x7ee787),
+    lv_color_hex(0x1e2228), // 0  grey  - no activity
+    lv_color_hex(0x27ae60), // 1  green - low
+    lv_color_hex(0xf39c12), // 2  amber - medium
+    lv_color_hex(0xe67e22), // 3  orange - high
+    lv_color_hex(0xe74c3c), // 4  red   - very high
 };
 static const lv_color_t LEVEL_BRIGHT[5] = {
-    lv_color_hex(0x161b22), // level 0 never animates
-    lv_color_hex(0x48b86b),
-    lv_color_hex(0x6fe08a),
-    lv_color_hex(0x8ef0a4),
-    lv_color_hex(0xa8ffb5),
+    lv_color_hex(0x1e2228), // 0  never animates
+    lv_color_hex(0x2ecc71), // 1  bright green
+    lv_color_hex(0xf1c40f), // 2  yellow
+    lv_color_hex(0xf0932b), // 3  bright orange
+    lv_color_hex(0xff5252), // 4  bright red
 };
 
 static lv_obj_t *s_screen = nullptr;
@@ -74,7 +75,7 @@ static const char *month_abbr(int month) {
     return MONTHS[month - 1];
 }
 
-static void update_month_labels(const GithubData &data) {
+static void update_month_labels(const StravaData &data) {
     static const uint8_t label_weeks[MONTH_LABEL_COUNT] = {0, 9, 18, 27, 36, 45};
     static const char *fallback_months[MONTH_LABEL_COUNT] = {"Apr", "Jun", "Aug", "Oct", "Dec", "Feb"};
 
@@ -95,7 +96,7 @@ static void update_month_labels(const GithubData &data) {
     }
 }
 
-lv_obj_t *display_grid_build(const char *username) {
+lv_obj_t *display_grid_build(const char *title) {
     memset(s_cells, 0, sizeof(s_cells));
     memset(s_cell_levels, 0, sizeof(s_cell_levels));
     memset(s_month_labels, 0, sizeof(s_month_labels));
@@ -116,7 +117,7 @@ lv_obj_t *display_grid_build(const char *username) {
         s_month_labels[i] = lbl;
     }
 
-    update_month_labels(GithubData{});
+    update_month_labels(StravaData{});
 
     // Grid cells: 53 columns x 7 rows
     for (int w = 0; w < GRID_WEEKS; w++) {
@@ -148,13 +149,11 @@ lv_obj_t *display_grid_build(const char *username) {
     lv_obj_set_style_pad_all(footer, 0, 0);
     lv_obj_clear_flag(footer, LV_OBJ_FLAG_SCROLLABLE);
 
-    // Username label - left
+    // Title label (left-aligned in footer)
     lv_obj_t *user_lbl = lv_label_create(footer);
     lv_obj_set_style_text_font(user_lbl, ui_font_label(), 0);
-    lv_obj_set_style_text_color(user_lbl, label_color, 0);
-    char buf[80];
-    snprintf(buf, sizeof(buf), "github.com/%s", username);
-    lv_label_set_text(user_lbl, buf);
+    lv_obj_set_style_text_color(user_lbl, lv_color_hex(0xfc4c02), 0); // Strava orange
+    lv_label_set_text(user_lbl, title ? title : "Exercise Load");
     lv_obj_align(user_lbl, LV_ALIGN_LEFT_MID, LEFT_PAD, 0);
 
     // Legend: 5 squares right-aligned, then "More" label
@@ -201,52 +200,51 @@ void display_grid_stop_animations() {
     }
 }
 
-void display_grid_update(const GithubData &data, const Config &cfg) {
+void display_grid_update(const StravaData &data, const Config &cfg) {
     if (!s_screen) return;
 
     display_grid_stop_animations();
     update_month_labels(data);
 
-    // Collect non-zero counts to compute percentile threshold
-    uint16_t counts[GRID_WEEKS * GRID_DAYS];
-    int count_n = 0;
+    // Collect non-zero loads to compute percentile threshold for animation
+    float loads[GRID_WEEKS * GRID_DAYS];
+    int load_n = 0;
     for (int w = 0; w < (int)data.week_count; w++) {
         for (int d = 0; d < GRID_DAYS; d++) {
-            if (data.days[w][d].count > 0)
-                counts[count_n++] = data.days[w][d].count;
+            if (data.days[w][d].load > 0.0f)
+                loads[load_n++] = data.days[w][d].load;
         }
     }
 
-    // Sort ascending (insertion sort - max 371 items)
-    for (int i = 1; i < count_n; i++) {
-        uint16_t key = counts[i];
+    // Insertion sort ascending (max 371 items)
+    for (int i = 1; i < load_n; i++) {
+        float key = loads[i];
         int j = i - 1;
-        while (j >= 0 && counts[j] > key) { counts[j+1] = counts[j]; j--; }
-        counts[j+1] = key;
+        while (j >= 0 && loads[j] > key) { loads[j+1] = loads[j]; j--; }
+        loads[j+1] = key;
     }
 
-    // Threshold: value at (100 - anim_top_pct)th percentile
-    uint16_t threshold = 0xFFFF;
-    if (count_n > 0 && cfg.anim_top_pct > 0) {
-        int idx = (int)(count_n * (100 - cfg.anim_top_pct) / 100.0f);
-        if (idx >= count_n) idx = count_n - 1;
-        threshold = counts[idx];
-        if (threshold == 0) threshold = 1; // never animate zero-count cells
+    // Threshold: top anim_top_pct % of active days get the breathing animation
+    float threshold = 1e9f;
+    if (load_n > 0 && cfg.anim_top_pct > 0) {
+        int idx = (int)(load_n * (100 - cfg.anim_top_pct) / 100.0f);
+        if (idx >= load_n) idx = load_n - 1;
+        threshold = loads[idx];
+        if (threshold <= 0.0f) threshold = 1.0f;
     }
 
     const int week_count = (data.week_count > GRID_WEEKS) ? GRID_WEEKS : data.week_count;
 
-    // Update cells and assign animations.
     for (int display_w = 0; display_w < GRID_WEEKS; display_w++) {
         for (int d = 0; d < GRID_DAYS; d++) {
-            uint16_t cnt = (display_w < week_count) ? data.days[display_w][d].count : 0;
-            uint8_t  lvl = (display_w < week_count) ? data.days[display_w][d].level : 0;
+            float   ld  = (display_w < week_count) ? data.days[display_w][d].load  : 0.0f;
+            uint8_t lvl = (display_w < week_count) ? data.days[display_w][d].level : 0;
             s_cell_levels[display_w][d] = lvl;
 
             lv_obj_set_user_data(s_cells[display_w][d], (void *)(uintptr_t)lvl);
             lv_obj_set_style_bg_color(s_cells[display_w][d], LEVEL_COLORS[lvl], 0);
 
-            if (cnt > 0 && cnt >= threshold) {
+            if (ld > 0.0f && ld >= threshold) {
                 lv_anim_t a;
                 lv_anim_init(&a);
                 lv_anim_set_var(&a, s_cells[display_w][d]);
