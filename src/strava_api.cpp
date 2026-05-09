@@ -13,6 +13,14 @@ uint8_t exercise_load_level(float load) {
     return 4;
 }
 
+uint8_t calorie_burn_level(float calories) {
+    if (calories <= 0.0f)  return 0;
+    if (calories < 250.0f) return 1;
+    if (calories < 500.0f) return 2;
+    if (calories < 750.0f) return 3;
+    return 4;
+}
+
 // ── Date helpers ──────────────────────────────────────────────────────────────
 
 static int32_t days_from_civil(int year, unsigned month, unsigned day) {
@@ -43,7 +51,7 @@ static bool parse_iso_date(const char *s, int32_t &out_days, uint8_t &out_month,
 }
 
 // ── Receive buffer ────────────────────────────────────────────────────────────
-// Compact format: active days only as [offset,load] pairs — ~2-3 KB typical.
+// Compact format: active days only as [offset,load,calories] triples — ~2-3 KB typical.
 // Static to avoid heap fragmentation across fetches.
 // NON-REENTRANT: strava_fetch() must never be called concurrently. The state
 // machine in main.cpp (FETCH_RUNNING guard) enforces this; do not bypass it.
@@ -157,6 +165,7 @@ bool strava_fetch(const char *url, StravaData &data) {
     data.current_month_load  = 0;
     data.current_month       = 0;
     data.anchor_week_start_days = 0;
+    data.current_day_days    = 0;
     data.latest_data_day_days   = 0;
     memset(data.days, 0, sizeof(data.days));
 
@@ -262,8 +271,23 @@ bool strava_fetch(const char *url, StravaData &data) {
         }
     }
 
+    // ── Parse current date from bridge generation time ──────────────────────
+    {
+        static const char GENERATED_AT_KEY[] = "\"generated_at\"";
+        int gpos = 0;
+        if (buf_find_json_key(s_body, body_len, GENERATED_AT_KEY, gpos) &&
+            gpos < body_len && s_body[gpos] == '"' && gpos + 11 <= body_len) {
+            char generated_str[11];
+            memcpy(generated_str, s_body + gpos + 1, 10);
+            generated_str[10] = '\0';
+            uint8_t gm = 0;
+            uint8_t gd = 0;
+            parse_iso_date(generated_str, data.current_day_days, gm, gd);
+        }
+    }
+
     // ── Parse days array ─────────────────────────────────────────────────────
-    // Format: "days":[[offset,load],...] — active days only, zeroes omitted.
+    // Format: "days":[[offset,load,calories],...] — active days only, zeroes omitted.
     static const char DAYS_KEY[] = "\"days\"";
     int pos = 0;
     if (!buf_find_json_key(s_body, body_len, DAYS_KEY, pos) || pos >= body_len || s_body[pos] != '[') {
@@ -276,6 +300,7 @@ bool strava_fetch(const char *url, StravaData &data) {
     struct ParsedDay {
         int32_t days_epoch;
         float   load;
+        float   calories;
         uint8_t month;
         uint8_t dom;
     };
@@ -295,6 +320,13 @@ bool strava_fetch(const char *url, StravaData &data) {
         if (pos >= body_len || s_body[pos] != ',') continue;
         pos++;
         float load_val = buf_parse_float(s_body, body_len, pos);
+        float calorie_val = 0.0f;
+
+        buf_skip_json_ws(s_body, body_len, pos);
+        if (pos < body_len && s_body[pos] == ',') {
+            pos++;
+            calorie_val = buf_parse_float(s_body, body_len, pos);
+        }
 
         // advance past the closing ']' of this pair
         int pair_end = buf_find_char(s_body, body_len, ']', pos);
@@ -318,6 +350,7 @@ bool strava_fetch(const char *url, StravaData &data) {
 
             s_pd[pd_count].days_epoch = d_epoch;
             s_pd[pd_count].load       = load_val;
+            s_pd[pd_count].calories   = calorie_val;
             s_pd[pd_count].month      = mo;
             s_pd[pd_count].dom        = dom;
             pd_count++;
@@ -333,7 +366,8 @@ bool strava_fetch(const char *url, StravaData &data) {
     }
 
     data.latest_data_day_days   = latest_day;
-    data.anchor_week_start_days = latest_day - weekday_sun0(latest_day);
+    if (data.current_day_days == 0) data.current_day_days = latest_day;
+    data.anchor_week_start_days = data.current_day_days - weekday_sun0(data.current_day_days);
     data.week_count             = GRID_WEEKS;
 
     // ── Map into grid ─────────────────────────────────────────────────────────
@@ -345,13 +379,16 @@ bool strava_fetch(const char *url, StravaData &data) {
         int week_diff = (int)(delta / 7);
         if (week_diff >= GRID_WEEKS) continue;
         int tw = (GRID_WEEKS - 1) - week_diff;               // 0 = oldest, 52 = current
-        data.days[tw][wd].load  = s_pd[i].load;
-        data.days[tw][wd].level = exercise_load_level(s_pd[i].load);
+        data.days[tw][wd].load           = s_pd[i].load;
+        data.days[tw][wd].load_level     = exercise_load_level(s_pd[i].load);
+        data.days[tw][wd].calories       = s_pd[i].calories;
+        data.days[tw][wd].calories_level = calorie_burn_level(s_pd[i].calories);
     }
 
     // ── Current-month load ────────────────────────────────────────────────────
-    if (latest_day != INT32_MIN) {
-        time_t secs = (time_t)latest_day * 86400;
+    int32_t current_month_ref_day = (data.current_day_days != 0) ? data.current_day_days : latest_day;
+    if (current_month_ref_day != INT32_MIN) {
+        time_t secs = (time_t)current_month_ref_day * 86400;
         struct tm tm_now;
         gmtime_r(&secs, &tm_now);
         data.current_month = (uint8_t)(tm_now.tm_mon + 1);

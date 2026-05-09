@@ -19,16 +19,125 @@ static Config     g_cfg;
 static StravaData g_data;
 static lv_obj_t  *g_screen_grid  = nullptr;
 static lv_obj_t  *g_screen_stats = nullptr;
-static bool       g_show_grid    = true;
+static lv_obj_t  *g_screen_calories = nullptr;
+static uint8_t    g_screen_index = 0;
 static bool       g_display_ready = false;
 static uint32_t   g_last_fetch_ms = 0;
 static lv_display_t *disp = nullptr;
 static lv_color_t *g_lvgl_buf = nullptr;
+static lv_obj_t  *g_network_overlay = nullptr;
+static lv_timer_t *g_network_overlay_timer = nullptr;
+
+struct ButtonState {
+    uint8_t pin;
+    bool last_raw_pressed;
+    bool stable_pressed;
+    bool long_press_handled;
+    uint32_t last_change_ms;
+    uint32_t pressed_ms;
+};
+
+static ButtonState g_next_button = { BTN_A, false, false, false, 0, 0 };
+static ButtonState g_info_button = { BTN_B, false, false, false, 0, 0 };
+
+enum ScreenIndex {
+    SCREEN_LOAD_GRID = 0,
+    SCREEN_STATS,
+    SCREEN_CALORIES_GRID,
+    SCREEN_COUNT,
+};
+
+static lv_obj_t *screen_for_index(uint8_t index) {
+    switch (index) {
+        case SCREEN_LOAD_GRID:     return g_screen_grid;
+        case SCREEN_STATS:         return g_screen_stats;
+        case SCREEN_CALORIES_GRID: return g_screen_calories;
+        default:                   return nullptr;
+    }
+}
+
+static uint32_t screen_period_ms(uint8_t index) {
+    if (index == SCREEN_STATS) return (uint32_t)g_cfg.screen_switch_secs * 1000UL;
+    return (uint32_t)g_cfg.screen_switch_secs * 3000UL;
+}
 
 static void style_active_screen_black() {
     lv_obj_t *screen = lv_scr_act();
     lv_obj_set_style_bg_color(screen, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
+}
+
+static void hide_network_overlay() {
+    if (g_network_overlay_timer) {
+        lv_timer_delete(g_network_overlay_timer);
+        g_network_overlay_timer = nullptr;
+    }
+    if (g_network_overlay) {
+        lv_obj_del(g_network_overlay);
+        g_network_overlay = nullptr;
+    }
+}
+
+static bool wifi_ap_mode_active() {
+    wifi_mode_t mode = WiFi.getMode();
+    return mode == WIFI_MODE_AP || mode == WIFI_MODE_APSTA;
+}
+
+static String current_ip_string() {
+    if (wifi_ap_mode_active()) return WiFi.softAPIP().toString();
+    if (WiFi.status() == WL_CONNECTED) return WiFi.localIP().toString();
+    return String("not connected");
+}
+
+static String current_ap_name_string() {
+    String ap_name = WiFi.softAPSSID();
+    if (ap_name.length() > 0) return ap_name;
+    return String(kSetupApSsid);
+}
+
+static void network_overlay_timeout_cb(lv_timer_t *) {
+    hide_network_overlay();
+}
+
+static void show_network_overlay() {
+    hide_network_overlay();
+
+    String text;
+    text.reserve(96);
+    text += "IP: ";
+    text += current_ip_string();
+    text += "\nAP: ";
+    text += current_ap_name_string();
+
+    lv_obj_t *overlay = lv_obj_create(lv_layer_top());
+    g_network_overlay = overlay;
+    lv_obj_set_size(overlay, 280, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(overlay, lv_color_hex(0x101820), 0);
+    lv_obj_set_style_bg_opa(overlay, LV_OPA_90, 0);
+    lv_obj_set_style_border_width(overlay, 1, 0);
+    lv_obj_set_style_border_color(overlay, lv_color_hex(0x39d353), 0);
+    lv_obj_set_style_radius(overlay, 12, 0);
+    lv_obj_set_style_pad_hor(overlay, 12, 0);
+    lv_obj_set_style_pad_ver(overlay, 10, 0);
+    lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_align(overlay, LV_ALIGN_TOP_MID, 0, 12);
+
+    lv_obj_t *label = lv_label_create(overlay);
+    lv_obj_set_width(label, 256);
+    lv_obj_set_style_text_color(label, lv_color_white(), 0);
+    lv_obj_set_style_text_font(label, ui_font_label(), 0);
+    lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(label, text.c_str());
+    lv_obj_center(label);
+
+    g_network_overlay_timer = lv_timer_create(network_overlay_timeout_cb, 4000, nullptr);
+}
+
+static void force_device_reboot() {
+    hide_network_overlay();
+    Serial.println("[Buttons] Long press detected - rebooting");
+    delay(50);
+    ESP.restart();
 }
 
 // ── LVGL callbacks ────────────────────────────────────────────────────────────
@@ -66,21 +175,88 @@ void set_screen_brightness_pct(uint8_t pct) {
 }
 
 // ── Screen switch timer ───────────────────────────────────────────────────────
-// Grid stays visible 3x longer than stats to give the activity view priority.
+// Grid screens stay visible 3x longer than stats to give the activity view priority.
 
 static lv_timer_t *g_screen_switch_timer = nullptr;
 
-static void screen_switch_cb(lv_timer_t *t) {
-    g_show_grid = !g_show_grid;
-    lv_obj_t *next = g_show_grid ? g_screen_grid : g_screen_stats;
+static void load_screen_index(uint8_t index, bool animate) {
+    lv_obj_t *next = screen_for_index(index);
     if (!next) return;
-    lv_scr_load_anim(next, LV_SCR_LOAD_ANIM_FADE_ON, 300, 0, false);
 
-    // Grid gets 3× the configured interval; stats gets 1×
-    uint32_t next_ms = g_show_grid
-        ? (uint32_t)g_cfg.screen_switch_secs * 3000UL
-        : (uint32_t)g_cfg.screen_switch_secs * 1000UL;
-    lv_timer_set_period(t, next_ms);
+    g_screen_index = index;
+    if (animate) {
+        lv_scr_load_anim(next, LV_SCR_LOAD_ANIM_FADE_ON, 300, 0, false);
+    } else {
+        lv_scr_load(next);
+    }
+
+    if (g_screen_switch_timer) {
+        lv_timer_set_period(g_screen_switch_timer, screen_period_ms(g_screen_index));
+        lv_timer_reset(g_screen_switch_timer);
+    }
+}
+
+static void advance_to_next_screen() {
+    for (int step = 0; step < SCREEN_COUNT; step++) {
+        uint8_t next_index = (g_screen_index + 1 + step) % SCREEN_COUNT;
+        if (!screen_for_index(next_index)) continue;
+        load_screen_index(next_index, true);
+        return;
+    }
+}
+
+static void screen_switch_cb(lv_timer_t *t) {
+    for (int step = 0; step < SCREEN_COUNT; step++) {
+        uint8_t next_index = (g_screen_index + 1 + step) % SCREEN_COUNT;
+        if (!screen_for_index(next_index)) continue;
+        load_screen_index(next_index, true);
+        return;
+    }
+
+    lv_obj_t *next = screen_for_index(g_screen_index);
+    if (!next) return;
+    lv_timer_set_period(t, screen_period_ms(g_screen_index));
+}
+
+static void handle_short_next_press() {
+    advance_to_next_screen();
+}
+
+static void handle_short_info_press() {
+    show_network_overlay();
+}
+
+static void button_tick(ButtonState &button, void (*short_press_cb)()) {
+    uint32_t now = millis();
+    bool raw_pressed = (digitalRead(button.pin) == LOW);
+
+    if (raw_pressed != button.last_raw_pressed) {
+        button.last_raw_pressed = raw_pressed;
+        button.last_change_ms = now;
+    }
+
+    if (now - button.last_change_ms < 30) return;
+
+    if (raw_pressed != button.stable_pressed) {
+        button.stable_pressed = raw_pressed;
+        if (button.stable_pressed) {
+            button.pressed_ms = now;
+            button.long_press_handled = false;
+        } else if (!button.long_press_handled && short_press_cb) {
+            short_press_cb();
+        }
+        return;
+    }
+
+    if (button.stable_pressed && !button.long_press_handled && now - button.pressed_ms >= 1200) {
+        button.long_press_handled = true;
+        force_device_reboot();
+    }
+}
+
+static void buttons_tick() {
+    button_tick(g_next_button, handle_short_next_press);
+    button_tick(g_info_button, handle_short_info_press);
 }
 
 // ── Async data refresh via FreeRTOS task ──────────────────────────────────────
@@ -143,7 +319,8 @@ static void apply_fetch_result(bool ok) {
         g_data = g_fetch_result;
         if (g_display_ready) {
             Serial.println("[Apply] Calling display_grid_update...");
-            display_grid_update(g_data, g_cfg);
+            display_grid_update(GRID_METRIC_LOAD, g_data, g_cfg);
+            display_grid_update(GRID_METRIC_CALORIES, g_data, g_cfg);
             Serial.println("[Apply] display_grid_update done");
             display_stats_update(g_data);
             display_stats_set_age(0);
@@ -162,7 +339,8 @@ static void do_fetch() {
         Serial.println("[Fetch] Skipping — WiFi not connected");
         return;
     }
-    display_grid_stop_animations();
+    display_grid_stop_animations(GRID_METRIC_LOAD);
+    display_grid_stop_animations(GRID_METRIC_CALORIES);
     g_fetch_started_ms = 0;
     g_fetch_abort_ms   = 0;
     g_fetch_abort  = false;
@@ -337,6 +515,8 @@ static void lvgl_init() {
 void setup() {
     Serial.begin(115200);
     DEV_DEVICE_INIT();
+    pinMode(BTN_A, INPUT_PULLUP);
+    pinMode(BTN_B, INPUT_PULLUP);
     delay(2000);
 
     if (!gfx->begin()) { Serial.println("GFX init failed!"); while (true); }
@@ -375,6 +555,7 @@ void setup() {
         });
         // Stay in AP loop — web server POST /save will reboot device
         while (true) {
+            buttons_tick();
             web_server_handle();
             lv_timer_handler();
             delay(5);
@@ -386,23 +567,28 @@ void setup() {
         gfx->setRotation(cfg.flip_screen ? 3 : 1);
         set_screen_brightness_pct(cfg.brightness);
         mqtt_client_reinit();
-        if (g_display_ready) display_grid_update(g_data, cfg);
+        if (g_display_ready) {
+            display_grid_update(GRID_METRIC_LOAD, g_data, cfg);
+            display_grid_update(GRID_METRIC_CALORIES, g_data, cfg);
+        }
     });
     mqtt_client_init(g_cfg);
 
-    g_screen_grid  = display_grid_build("Exercise Load", g_cfg);
-    g_screen_stats = display_stats_build("Exercise Load");
-    g_display_ready = (g_screen_grid != nullptr && g_screen_stats != nullptr);
+    g_screen_grid     = display_grid_build(GRID_METRIC_LOAD, "Exercise Load", g_cfg);
+    g_screen_stats    = display_stats_build("Exercise Load");
+    g_screen_calories = display_grid_build(GRID_METRIC_CALORIES, "Calories Burned", g_cfg);
+    g_display_ready = (g_screen_grid != nullptr && g_screen_stats != nullptr && g_screen_calories != nullptr);
+    g_screen_index = SCREEN_LOAD_GRID;
 
-    lv_scr_load(g_screen_grid ? g_screen_grid : lv_scr_act());
+    load_screen_index(g_screen_grid ? SCREEN_LOAD_GRID : g_screen_index, false);
 
     if (g_display_ready) {
         do_fetch();
     }
 
-    // Grid is shown first, so start with 3× interval
+    // Load grid is shown first, so start with its longer interval.
     g_screen_switch_timer = lv_timer_create(screen_switch_cb,
-                    (uint32_t)g_cfg.screen_switch_secs * 3000UL, nullptr);
+                    screen_period_ms(g_screen_index), nullptr);
     lv_timer_create(refresh_timer_cb,
                     (uint32_t)g_cfg.refresh_interval_min * 60UL * 1000UL, nullptr);
 
@@ -462,6 +648,7 @@ static void wifi_watchdog_tick() {
 // ── loop ──────────────────────────────────────────────────────────────────────
 
 void loop() {
+    buttons_tick();
     wifi_watchdog_tick();
     fetch_tick();
     lv_timer_handler();

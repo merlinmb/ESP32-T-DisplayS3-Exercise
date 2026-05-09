@@ -51,16 +51,17 @@ def _temp_activity_db():
             CREATE TABLE activities (
                 id INTEGER PRIMARY KEY,
                 start_date_local TEXT NOT NULL,
-                moving_time_in_seconds INTEGER NOT NULL
+                moving_time_in_seconds INTEGER NOT NULL,
+                calories INTEGER NOT NULL
             )
             """
         )
         conn.executemany(
-            "INSERT INTO activities (start_date_local, moving_time_in_seconds) VALUES (?, ?)",
+            "INSERT INTO activities (start_date_local, moving_time_in_seconds, calories) VALUES (?, ?, ?)",
             [
-                (f"{first_day.isoformat()}T06:00:00", 1800),
-                (f"{first_day.isoformat()}T18:30:00", 900),
-                (f"{busiest_day.isoformat()}T07:15:00", 7200),
+                (f"{first_day.isoformat()}T06:00:00", 1800, 210),
+                (f"{first_day.isoformat()}T18:30:00", 900, 110),
+                (f"{busiest_day.isoformat()}T07:15:00", 7200, 860),
             ],
         )
         conn.commit()
@@ -86,19 +87,50 @@ def _temp_activity_db_camel_case():
             CREATE TABLE activities (
                 activityId INTEGER PRIMARY KEY,
                 startDateTime TEXT NOT NULL,
-                movingTimeInSeconds INTEGER NOT NULL
+                movingTimeInSeconds INTEGER NOT NULL,
+                caloriesBurned INTEGER NOT NULL
             )
             """
         )
         conn.executemany(
-            "INSERT INTO activities (startDateTime, movingTimeInSeconds) VALUES (?, ?)",
+            "INSERT INTO activities (startDateTime, movingTimeInSeconds, caloriesBurned) VALUES (?, ?, ?)",
             [
-                (f"{first_day.isoformat()}T06:30:00", 1500),
-                (f"{busiest_day.isoformat()}T17:45:00", 5400),
+                (f"{first_day.isoformat()}T06:30:00", 1500, 180),
+                (f"{busiest_day.isoformat()}T17:45:00", 5400, 640),
             ],
         )
         conn.commit()
         yield db_path, first_day.isoformat(), busiest_day.isoformat()
+    finally:
+        conn.close()
+        Path(db_path).unlink(missing_ok=True)
+
+
+@contextmanager
+def _temp_activity_db_without_calories():
+    start_date, _, _ = _current_window()
+    sample_day = start_date + timedelta(days=4)
+
+    with NamedTemporaryFile(suffix=".sqlite3", delete=False) as temp_db:
+        db_path = temp_db.name
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE activities (
+                id INTEGER PRIMARY KEY,
+                start_date_local TEXT NOT NULL,
+                moving_time_in_seconds INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO activities (start_date_local, moving_time_in_seconds) VALUES (?, ?)",
+            (f"{sample_day.isoformat()}T09:00:00", 2400),
+        )
+        conn.commit()
+        yield db_path, sample_day.isoformat()
     finally:
         conn.close()
         Path(db_path).unlink(missing_ok=True)
@@ -131,7 +163,7 @@ class StravaBridgeApiTests(unittest.TestCase):
         self.assertIn("total_activities", payload)
         self.assertIn("busiest_date", payload)
         self.assertIn("busiest_load", payload)
-        self.assertTrue(all(isinstance(day, list) and len(day) == 2 for day in payload["days"]))
+        self.assertTrue(all(isinstance(day, list) and len(day) == 3 for day in payload["days"]))
 
     def test_get_exercise_load_returns_expected_aggregates(self):
         with _temp_activity_db() as (db_path, first_day, busiest_day):
@@ -145,11 +177,11 @@ class StravaBridgeApiTests(unittest.TestCase):
 
         start_date = datetime.fromisoformat(payload["start"]).date()
         loads_by_day = {
-            (start_date + timedelta(days=offset)).isoformat(): load
-            for offset, load in payload["days"]
+            (start_date + timedelta(days=offset)).isoformat(): (load, calories)
+            for offset, load, calories in payload["days"]
         }
-        self.assertEqual(loads_by_day[first_day], 45.0)
-        self.assertEqual(loads_by_day[busiest_day], 120.0)
+        self.assertEqual(loads_by_day[first_day], (45.0, 320.0))
+        self.assertEqual(loads_by_day[busiest_day], (120.0, 860.0))
 
     def test_http_endpoint_serves_json_results(self):
         with _temp_activity_db() as (db_path, _, busiest_day):
@@ -165,7 +197,7 @@ class StravaBridgeApiTests(unittest.TestCase):
                 self._assert_bridge_payload_shape(payload)
                 self.assertEqual(payload["busiest_date"], busiest_day)
                 self.assertGreater(payload["total_load"], 0.0)
-                self.assertTrue(any(load > 0 for _, load in payload["days"]))
+                self.assertTrue(any(load > 0 and calories >= 0 for _, load, calories in payload["days"]))
 
     def test_threaded_server_serves_parallel_requests(self):
         class SlowHandler(strava_bridge.Handler):
@@ -220,11 +252,23 @@ class StravaBridgeApiTests(unittest.TestCase):
 
         start_date = datetime.fromisoformat(payload["start"]).date()
         loads_by_day = {
-            (start_date + timedelta(days=offset)).isoformat(): load
-            for offset, load in payload["days"]
+            (start_date + timedelta(days=offset)).isoformat(): (load, calories)
+            for offset, load, calories in payload["days"]
         }
-        self.assertEqual(loads_by_day[first_day], 25.0)
-        self.assertEqual(loads_by_day[busiest_day], 90.0)
+        self.assertEqual(loads_by_day[first_day], (25.0, 180.0))
+        self.assertEqual(loads_by_day[busiest_day], (90.0, 640.0))
+
+    def test_get_exercise_load_defaults_calories_to_zero_when_schema_lacks_it(self):
+        with _temp_activity_db_without_calories() as (db_path, sample_day):
+            payload = strava_bridge.get_exercise_load(db_path)
+
+        self._assert_bridge_payload_shape(payload)
+        start_date = datetime.fromisoformat(payload["start"]).date()
+        loads_by_day = {
+            (start_date + timedelta(days=offset)).isoformat(): (load, calories)
+            for offset, load, calories in payload["days"]
+        }
+        self.assertEqual(loads_by_day[sample_day], (40.0, 0.0))
 
     def test_get_exercise_load_quotes_schema_identifiers(self):
         start_date, _, _ = _current_window()

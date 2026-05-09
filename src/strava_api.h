@@ -7,9 +7,12 @@
 // ── Per-day exercise data ─────────────────────────────────────────────────────
 
 struct ExerciseDay {
-    float   load;   // moving time in minutes for this day
-    uint8_t level;  // 0 = none | 1 = low (<50) | 2 = medium (<100)
-                    // 3 = high (<150) | 4 = very high (>=150)
+    float   load;            // moving time in minutes for this day
+    uint8_t load_level;      // 0 = none | 1 = low (<50) | 2 = medium (<100)
+                            // 3 = high (<150) | 4 = very high (>=150)
+    float   calories;        // calories burned for this day
+    uint8_t calories_level;  // 0 = none | 1 = light (<250) | 2 = medium (<500)
+                            // 3 = high (<750) | 4 = very high (>=750)
 };
 
 // ── Full dataset (53 weeks x 7 days) ─────────────────────────────────────────
@@ -31,6 +34,7 @@ struct StravaData {
     uint8_t  current_month;           // 1-12
 
     int32_t  anchor_week_start_days;  // days since Unix epoch for week-52 Sunday
+    int32_t  current_day_days;        // days since epoch for the bridge generation date
     int32_t  latest_data_day_days;    // days since epoch for the most recent day
 
     bool     valid;                   // false until first successful fetch
@@ -38,6 +42,9 @@ struct StravaData {
 
 // Convert a load value (minutes) to a display level 0-4
 uint8_t exercise_load_level(float load);
+
+// Convert a calorie value to a display level 0-4
+uint8_t calorie_burn_level(float calories);
 
 // Fetch exercise load from the strava_bridge server.
 //   url  – full URL, e.g. "http://192.168.1.54:8082/api/exercise-load"

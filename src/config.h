@@ -18,7 +18,7 @@ struct Config {
 
     // ── Display ───────────────────────────────────────────────────────────────
     uint8_t  brightness;            // LCD backlight 0-100 % (default 100)
-    uint16_t screen_switch_secs;    // seconds between grid/stats screens (default 30)
+    uint16_t screen_switch_secs;    // seconds between load/stats/calories screens (default 30)
     uint16_t refresh_interval_min;  // data refresh period in minutes (default 30)
     uint8_t  history_months;        // months of history to show on the grid (default 6)
     uint8_t  anim_top_pct;          // animate top N % of active days (default 20)

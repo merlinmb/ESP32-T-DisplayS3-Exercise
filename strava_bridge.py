@@ -16,17 +16,19 @@ JSON response format:
   "generated_at": "2026-05-08T12:00:00",
   "start": "2025-06-01",
   "weeks": 53,
-  "days": [[0,45.5],[3,120.3],...],
+    "days": [[0,45.5,320],[3,120.3,860],...],
   "total_load": 12345.0,
   "total_activities": 156,
   "busiest_date": "2025-08-15",
   "busiest_load": 285.3
 }
 
-"days" contains only active days as [offset, load] pairs where offset is
-days since "start". Zero-load days are omitted.
+"days" contains only active days as [offset, load, calories] triples where
+offset is days since "start". Zero-load days are omitted.
 
 "load" is total moving time for that day in minutes.
+"calories" is the summed calories burned for that day when the source schema
+exposes a calories column, otherwise 0.
 Level thresholds (matching the display colours):
   0  = no activity
   1  = 0-50 min  (Low,  green)
@@ -109,6 +111,17 @@ def get_exercise_load(db_path: str) -> dict:
              if c in columns),
             None
         )
+        calorie_col = next(
+            (c for c in [
+                "calories",
+                "calories_burned",
+                "caloriesBurned",
+                "kilocalories",
+                "kiloCalories",
+            ]
+             if c in columns),
+            None
+        )
 
         if not date_col or not time_col:
             return {
@@ -120,7 +133,10 @@ def get_exercise_load(db_path: str) -> dict:
         # Columns ending in '_in_seconds' or with name 'moving_time' from Strava are seconds.
         is_seconds = "second" in time_col.lower() or time_col in ("moving_time", "elapsed_time")
         divisor = 60.0 if is_seconds else 1.0
-        print(f"[Bridge] Using date='{date_col}', time='{time_col}' (divisor={divisor})")
+        print(
+            f"[Bridge] Using date='{date_col}', time='{time_col}', calories='{calorie_col}' "
+            f"(divisor={divisor})"
+        )
 
         # --- Date range: last WEEKS weeks, aligned to Sunday ---
         today = datetime.now(timezone.utc).date()
@@ -132,12 +148,17 @@ def get_exercise_load(db_path: str) -> dict:
 
         quoted_date_col = _quote_identifier(date_col)
         quoted_time_col = _quote_identifier(time_col)
+        calories_expr = "0.0 AS total_calories"
+        if calorie_col:
+            quoted_calorie_col = _quote_identifier(calorie_col)
+            calories_expr = f"SUM(COALESCE(CAST({quoted_calorie_col} AS FLOAT), 0.0)) AS total_calories"
 
         # --- Query ---
         query = f"""
             SELECT
                 date({quoted_date_col})                   AS activity_date,
-                SUM(CAST({quoted_time_col} AS FLOAT) / ?) AS total_minutes
+                SUM(CAST({quoted_time_col} AS FLOAT) / ?) AS total_minutes,
+                {calories_expr}
             FROM {quoted_activity_table}
             WHERE date({quoted_date_col}) BETWEEN ? AND ?
             GROUP BY date({quoted_date_col})
@@ -146,10 +167,15 @@ def get_exercise_load(db_path: str) -> dict:
         cursor.execute(query, (divisor, start_date.isoformat(), end_date.isoformat()))
         rows = cursor.fetchall()
 
-    load_by_date = {row["activity_date"]: round(float(row["total_minutes"]), 1)
-                    for row in rows}
+    load_by_date = {
+        row["activity_date"]: {
+            "load": round(float(row["total_minutes"]), 1),
+            "calories": round(float(row["total_calories"] or 0.0), 1),
+        }
+        for row in rows
+    }
 
-    # --- Build compact day list (active days only, [offset, load] pairs) ---
+    # --- Build compact day list (active days only, [offset, load, calories] triples) ---
     days         = []
     busiest_date = ""
     busiest_load = 0.0
@@ -160,9 +186,11 @@ def get_exercise_load(db_path: str) -> dict:
     current = start_date
     while current <= end_date:
         ds   = current.isoformat()
-        load = load_by_date.get(ds, 0.0)
+        day_totals = load_by_date.get(ds, {"load": 0.0, "calories": 0.0})
+        load = day_totals["load"]
+        calories = day_totals["calories"]
         if load > 0:
-            days.append([offset, round(load, 1)])
+            days.append([offset, round(load, 1), round(calories, 1)])
             total_active += 1
         total_load += load
         if load > busiest_load:
