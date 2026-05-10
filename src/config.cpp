@@ -4,8 +4,8 @@
 static Preferences prefs;
 
 void config_apply_defaults(Config &cfg) {
-    // Clamp brightness: 0 = unset -> 100 %, >100 = invalid -> reset to 100 %
-    if (cfg.brightness == 0 || cfg.brightness > 100) cfg.brightness = 100;
+    // Clamp brightness: 0 is a valid off state, values >100 reset to 100 %.
+    if (cfg.brightness > 100) cfg.brightness = 100;
     if (cfg.screen_switch_secs == 0)   cfg.screen_switch_secs   = 30;
     if (cfg.refresh_interval_min == 0) cfg.refresh_interval_min = 30;
     if (cfg.history_months < kMinHistoryMonths || cfg.history_months > kMaxHistoryMonths)
@@ -24,7 +24,7 @@ void config_load(Config &cfg) {
     prefs.getString("wifi_ssid",   cfg.wifi_ssid,          sizeof(cfg.wifi_ssid));
     prefs.getString("wifi_pass",   cfg.wifi_password,      sizeof(cfg.wifi_password));
     prefs.getString("srv_url",     cfg.strava_server_url,  sizeof(cfg.strava_server_url));
-    cfg.brightness           = prefs.getUChar( "brightness",  0);
+    cfg.brightness           = prefs.getUChar( "brightness",  255);
     cfg.screen_switch_secs   = prefs.getUShort("switch_sec",  0);
     cfg.refresh_interval_min = prefs.getUShort("refresh_min", 0);
     cfg.history_months       = prefs.getUChar( "hist_months", 0);

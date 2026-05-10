@@ -7,7 +7,7 @@ import unittest
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
@@ -27,7 +27,7 @@ REMOTE_BRIDGE_URL = os.environ.get(
 
 
 def _current_window():
-    today = datetime.now(timezone.utc).date()
+    today = strava_bridge._now_in_timezone(strava_bridge.DEFAULT_TIMEZONE).date()
     days_since_sunday = (today.weekday() + 1) % 7
     current_sunday = today - timedelta(days=days_since_sunday)
     start_date = current_sunday - timedelta(weeks=strava_bridge.WEEKS - 1)

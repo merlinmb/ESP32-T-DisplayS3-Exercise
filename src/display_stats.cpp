@@ -8,6 +8,7 @@ static lv_obj_t *s_month_label   = nullptr; // updated with month name on data r
 static lv_obj_t *s_total_val     = nullptr;
 static lv_obj_t *s_busiest_val   = nullptr;
 static lv_obj_t *s_age_label     = nullptr;
+static lv_obj_t *s_footer_title  = nullptr;
 
 lv_obj_t *display_stats_build(const char *title) {
     s_screen = lv_obj_create(NULL);
@@ -22,14 +23,12 @@ lv_obj_t *display_stats_build(const char *title) {
     const int cards_left = (screen_w - (card_w * 3 + card_gap * 2)) / 2;
     const int value_y   = 50;
 
-    // Title label (Strava orange)
-    lv_obj_t *title_lbl = lv_label_create(s_screen);
-    lv_obj_set_style_text_font(title_lbl, ui_font_label(), 0);
-    lv_obj_set_style_text_color(title_lbl, lv_color_hex(0xfc4c02), 0);
-    lv_obj_set_style_text_align(title_lbl, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_width(title_lbl, screen_w - 24);
-    lv_label_set_text(title_lbl, title ? title : "Exercise Load");
-    lv_obj_align(title_lbl, LV_ALIGN_TOP_MID, 0, 10);
+    // Footer title matches the grid screens so the active screen is clear.
+    s_footer_title = lv_label_create(s_screen);
+    lv_obj_set_style_text_font(s_footer_title, ui_font_label(), 0);
+    lv_obj_set_style_text_color(s_footer_title, lv_color_hex(0xfc4c02), 0);
+    lv_label_set_text(s_footer_title, title ? title : "Exercise Load");
+    lv_obj_align(s_footer_title, LV_ALIGN_BOTTOM_LEFT, 3, -5);
 
     // Three stat cards:
     //   [0] This month load (hours)   green
@@ -71,10 +70,10 @@ lv_obj_t *display_stats_build(const char *title) {
     s_age_label = lv_label_create(s_screen);
     lv_obj_set_style_text_font(s_age_label, ui_font_label(), 0);
     lv_obj_set_style_text_color(s_age_label, label_color, 0);
-    lv_obj_set_style_text_align(s_age_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_width(s_age_label, screen_w - 24);
+    lv_obj_set_style_text_align(s_age_label, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_width(s_age_label, 150);
     lv_label_set_text(s_age_label, "");
-    lv_obj_align(s_age_label, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_align(s_age_label, LV_ALIGN_BOTTOM_RIGHT, -3, -5);
 
     return s_screen;
 }

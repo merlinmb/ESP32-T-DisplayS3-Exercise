@@ -81,7 +81,7 @@ static String build_page() {
     html += F("<div class='card'><h2>Display</h2>"
               "<label>LCD Brightness (%)</label>"
               "<div class='range-row'>"
-              "<input type='range' name='brightness' min='1' max='100' value='");
+              "<input type='range' name='brightness' min='0' max='100' value='");
     html += s_cfg->brightness;
     html += F("' oninput='this.nextElementSibling.textContent=this.value+\"%\"'>"
               "<span class='range-val'>");

@@ -89,6 +89,11 @@ Run it directly:
 python strava_bridge.py --db C:\path\to\your\strava.sqlite3 --port 8082
 ```
 
+The bridge now computes the current week and `generated_at` in `Europe/London`
+by default so BST is applied automatically. Override that with either
+`--timezone Area/City` or the `STRAVA_BRIDGE_TIMEZONE` environment variable if
+the bridge runs somewhere else.
+
 Or build and run it with Docker after adjusting the volume mount in `docker-compose.strava-bridge.yml`:
 
 ```powershell

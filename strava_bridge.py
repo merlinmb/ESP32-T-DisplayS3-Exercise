@@ -40,14 +40,53 @@ Level thresholds (matching the display colours):
 import sqlite3
 import json
 import argparse
+import os
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 DB_PATH_DEFAULT = "/home/merlin/portainer_data/strava/storage/database"
 DEFAULT_PORT    = 8082
 WEEKS           = 53
+DEFAULT_TIMEZONE = os.environ.get("STRAVA_BRIDGE_TIMEZONE", "Europe/London")
+
+
+def _get_timezone(timezone_name: str) -> ZoneInfo:
+    try:
+        return ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError as exc:
+        raise ValueError(f"Unknown timezone '{timezone_name}'") from exc
+
+
+def _last_sunday_of_month(year: int, month: int) -> int:
+    if month == 12:
+        first_of_next_month = datetime(year + 1, 1, 1)
+    else:
+        first_of_next_month = datetime(year, month + 1, 1)
+    last_day = first_of_next_month - timedelta(days=1)
+    return last_day.day - ((last_day.weekday() + 1) % 7)
+
+
+def _fallback_europe_london_now() -> datetime:
+    utc_now = datetime.now(timezone.utc)
+    year = utc_now.year
+    bst_start = datetime(year, 3, _last_sunday_of_month(year, 3), 1, tzinfo=timezone.utc)
+    bst_end = datetime(year, 10, _last_sunday_of_month(year, 10), 1, tzinfo=timezone.utc)
+    is_bst = bst_start <= utc_now < bst_end
+    offset = timedelta(hours=1 if is_bst else 0)
+    tz_name = "BST" if is_bst else "GMT"
+    return utc_now.astimezone(timezone(offset, tz_name))
+
+
+def _now_in_timezone(timezone_name: str) -> datetime:
+    try:
+        return datetime.now(_get_timezone(timezone_name))
+    except ValueError:
+        if timezone_name == "Europe/London":
+            return _fallback_europe_london_now()
+        raise
 
 
 def _quote_identifier(identifier: str) -> str:
@@ -57,7 +96,7 @@ def _quote_identifier(identifier: str) -> str:
     return '"' + identifier.replace('"', '""') + '"'
 
 
-def get_exercise_load(db_path: str) -> dict:
+def get_exercise_load(db_path: str, timezone_name: str = DEFAULT_TIMEZONE) -> dict:
     """Query the SQLite database and return exercise load data for the last 53 weeks."""
     with closing(sqlite3.connect(db_path)) as conn:
         conn.row_factory = sqlite3.Row
@@ -139,7 +178,7 @@ def get_exercise_load(db_path: str) -> dict:
         )
 
         # --- Date range: last WEEKS weeks, aligned to Sunday ---
-        today = datetime.now(timezone.utc).date()
+        today = _now_in_timezone(timezone_name).date()
         # weekday(): Mon=0 ... Sun=6  ->  days since last Sunday
         days_since_sunday = (today.weekday() + 1) % 7
         current_sunday = today - timedelta(days=days_since_sunday)
@@ -200,7 +239,7 @@ def get_exercise_load(db_path: str) -> dict:
         offset  += 1
 
     return {
-        "generated_at":    datetime.now(timezone.utc).isoformat(),
+        "generated_at":    _now_in_timezone(timezone_name).isoformat(),
         "start":           start_date.isoformat(),
         "weeks":           WEEKS,
         "days":            days,
@@ -213,12 +252,13 @@ def get_exercise_load(db_path: str) -> dict:
 
 class Handler(BaseHTTPRequestHandler):
     db_path: str = DB_PATH_DEFAULT
+    timezone_name: str = DEFAULT_TIMEZONE
 
     def do_GET(self):
         path = urlparse(self.path).path.rstrip("/")
         if path == "/api/exercise-load":
             try:
-                data = get_exercise_load(self.db_path)
+                data = get_exercise_load(self.db_path, self.timezone_name)
                 body = json.dumps(data).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type",   "application/json")
@@ -256,14 +296,24 @@ if __name__ == "__main__":
         default=DEFAULT_PORT,
         help=f"HTTP port to listen on (default: {DEFAULT_PORT})",
     )
+    parser.add_argument(
+        "--timezone",
+        default=DEFAULT_TIMEZONE,
+        help=(
+            "IANA timezone used for the current reporting window and generated_at "
+            f"(default: {DEFAULT_TIMEZONE})"
+        ),
+    )
     args = parser.parse_args()
 
     Handler.db_path = args.db
+    Handler.timezone_name = args.timezone
 
     print("=" * 60)
     print("  Strava Exercise Load Bridge Server")
     print("=" * 60)
     print(f"  Database : {args.db}")
+    print(f"  Timezone : {args.timezone}")
     print(f"  Endpoint : http://0.0.0.0:{args.port}/api/exercise-load")
     print("=" * 60)
 

@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "main.cpp"
+    SRC_DIRS "."
     INCLUDE_DIRS "../include" ".."
     REQUIRES
         esp_event

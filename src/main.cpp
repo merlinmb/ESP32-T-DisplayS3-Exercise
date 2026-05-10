@@ -8,8 +8,10 @@
 #include "secrets.h"
 #include "config.h"
 #include "strava_api.h"
+#include "display_calorie_trend.h"
 #include "display_grid.h"
 #include "display_stats.h"
+#include "display_status.h"
 #include "web_server.h"
 #include "ui_fonts.h"
 #include "screen_brightness.h"
@@ -17,16 +19,21 @@
 
 static Config     g_cfg;
 static StravaData g_data;
+static lv_obj_t  *g_screen_status = nullptr;
 static lv_obj_t  *g_screen_grid  = nullptr;
 static lv_obj_t  *g_screen_stats = nullptr;
 static lv_obj_t  *g_screen_calories = nullptr;
+static lv_obj_t  *g_screen_calorie_trend = nullptr;
 static uint8_t    g_screen_index = 0;
 static bool       g_display_ready = false;
 static uint32_t   g_last_fetch_ms = 0;
+static uint32_t   g_last_fetch_attempt_ms = 0;
+static bool       g_trend_refresh_pending = true;
 static lv_display_t *disp = nullptr;
 static lv_color_t *g_lvgl_buf = nullptr;
 static lv_obj_t  *g_network_overlay = nullptr;
 static lv_timer_t *g_network_overlay_timer = nullptr;
+static uint32_t   g_last_status_refresh_ms = 0;
 
 struct ButtonState {
     uint8_t pin;
@@ -41,17 +48,38 @@ static ButtonState g_next_button = { BTN_A, false, false, false, 0, 0 };
 static ButtonState g_info_button = { BTN_B, false, false, false, 0, 0 };
 
 enum ScreenIndex {
-    SCREEN_LOAD_GRID = 0,
+    SCREEN_STATUS = 0,
+    SCREEN_LOAD_GRID,
     SCREEN_STATS,
     SCREEN_CALORIES_GRID,
+    SCREEN_CALORIE_TREND,
     SCREEN_COUNT,
 };
 
+static void load_screen_index(uint8_t index, bool animate);
+static void refresh_screen_selection(bool prefer_primary);
+static void update_status_screen();
+static void do_fetch();
+static void refresh_trend_screen_if_needed();
+
+static const char *screen_name(uint8_t index) {
+    switch (index) {
+        case SCREEN_STATUS:        return "status";
+        case SCREEN_LOAD_GRID:     return "load-grid";
+        case SCREEN_STATS:         return "stats";
+        case SCREEN_CALORIES_GRID: return "calories-grid";
+        case SCREEN_CALORIE_TREND: return "calorie-trend";
+        default:                   return "unknown";
+    }
+}
+
 static lv_obj_t *screen_for_index(uint8_t index) {
     switch (index) {
+        case SCREEN_STATUS:        return g_screen_status;
         case SCREEN_LOAD_GRID:     return g_screen_grid;
         case SCREEN_STATS:         return g_screen_stats;
         case SCREEN_CALORIES_GRID: return g_screen_calories;
+        case SCREEN_CALORIE_TREND: return g_screen_calorie_trend;
         default:                   return nullptr;
     }
 }
@@ -59,6 +87,47 @@ static lv_obj_t *screen_for_index(uint8_t index) {
 static uint32_t screen_period_ms(uint8_t index) {
     if (index == SCREEN_STATS) return (uint32_t)g_cfg.screen_switch_secs * 1000UL;
     return (uint32_t)g_cfg.screen_switch_secs * 3000UL;
+}
+
+static bool has_valid_dataset() {
+    return g_data.valid;
+}
+
+static bool screen_is_available(uint8_t index) {
+    if (!screen_for_index(index)) return false;
+
+    switch (index) {
+        case SCREEN_STATUS:
+            return !has_valid_dataset();
+        case SCREEN_LOAD_GRID:
+        case SCREEN_STATS:
+        case SCREEN_CALORIES_GRID:
+        case SCREEN_CALORIE_TREND:
+            return has_valid_dataset();
+        default:
+            return false;
+    }
+}
+
+static uint8_t first_available_screen() {
+    for (uint8_t index = 0; index < SCREEN_COUNT; ++index) {
+        if (screen_is_available(index)) return index;
+    }
+    return SCREEN_STATUS;
+}
+
+static const char *wifi_status_text(wl_status_t status) {
+    switch (status) {
+        case WL_CONNECTED:      return "connected";
+        case WL_NO_SHIELD:      return "radio unavailable";
+        case WL_IDLE_STATUS:    return "idle";
+        case WL_NO_SSID_AVAIL:  return "ssid unavailable";
+        case WL_SCAN_COMPLETED: return "scan completed";
+        case WL_CONNECT_FAILED: return "connect failed";
+        case WL_CONNECTION_LOST:return "connection lost";
+        case WL_DISCONNECTED:   return "disconnected";
+        default:                return "unknown";
+    }
 }
 
 static void style_active_screen_black() {
@@ -89,6 +158,14 @@ static String current_ip_string() {
     return String("not connected");
 }
 
+static String current_wifi_ssid_string() {
+    if (WiFi.status() == WL_CONNECTED) {
+        String ssid = WiFi.SSID();
+        if (ssid.length() > 0) return ssid;
+    }
+    return String("not connected");
+}
+
 static String current_ap_name_string() {
     String ap_name = WiFi.softAPSSID();
     if (ap_name.length() > 0) return ap_name;
@@ -103,9 +180,11 @@ static void show_network_overlay() {
     hide_network_overlay();
 
     String text;
-    text.reserve(96);
+    text.reserve(128);
     text += "IP: ";
     text += current_ip_string();
+    text += "\nWi-Fi: ";
+    text += current_wifi_ssid_string();
     text += "\nAP: ";
     text += current_ap_name_string();
 
@@ -159,19 +238,54 @@ static void my_log_print(lv_log_level_t level, const char *buf) {
 
 // ── Display brightness ────────────────────────────────────────────────────────
 
-static void apply_brightness(uint8_t val) {
-    static bool backlight_channel_attached = false;
-    if (!backlight_channel_attached) {
-        ledcAttachChannel(GFX_BL, 1000, 8, 1);
-        backlight_channel_attached = true;
+static void apply_brightness(uint8_t level) {
+    static bool backlight_initialized = false;
+    static uint8_t current_level = 0;
+    static constexpr uint8_t kBacklightSteps = 16;
+
+    if (level > kBacklightSteps) level = kBacklightSteps;
+
+    if (!backlight_initialized) {
+        pinMode(GFX_BL, OUTPUT);
+        digitalWrite(GFX_BL, LOW);
+        backlight_initialized = true;
     }
-    ledcWrite(GFX_BL, val);
+
+    // The LilyGo T-Display S3 backlight is controlled by a 16-step driver on
+    // GPIO38. It expects pulses to advance brightness rather than a PWM duty.
+    if (level == 0) {
+        digitalWrite(GFX_BL, LOW);
+        delay(3);
+        current_level = 0;
+        return;
+    }
+
+    if (current_level == 0) {
+        digitalWrite(GFX_BL, HIGH);
+        current_level = kBacklightSteps;
+        delayMicroseconds(30);
+    }
+
+    int from = kBacklightSteps - current_level;
+    int to = kBacklightSteps - level;
+    int pulses = (kBacklightSteps + to - from) % kBacklightSteps;
+    for (int i = 0; i < pulses; ++i) {
+        digitalWrite(GFX_BL, LOW);
+        digitalWrite(GFX_BL, HIGH);
+    }
+    current_level = level;
 }
 
-// Public API: set brightness by percentage (0-100). Maps to 0-255 for LEDC.
+// Public API: set brightness by percentage (0-100). Maps to the panel's 16
+// hardware backlight levels, with 0 as a hard off state.
 void set_screen_brightness_pct(uint8_t pct) {
     if (pct > 100) pct = 100;
-    apply_brightness((uint8_t)((pct * 255UL) / 100UL));
+    uint8_t level = 0;
+    if (pct != 0) {
+        level = (uint8_t)((pct * 16UL + 99UL) / 100UL);
+        if (level == 0) level = 1;
+    }
+    apply_brightness(level);
 }
 
 // ── Screen switch timer ───────────────────────────────────────────────────────
@@ -179,15 +293,55 @@ void set_screen_brightness_pct(uint8_t pct) {
 
 static lv_timer_t *g_screen_switch_timer = nullptr;
 
+static void force_screen_redraw(lv_obj_t *scr) {
+    if (!scr) return;
+    lv_obj_invalidate(scr);
+}
+
 static void load_screen_index(uint8_t index, bool animate) {
+    (void)animate;
+    uint8_t requested_index = index;
+
+    if (!screen_is_available(index)) {
+        index = first_available_screen();
+    }
+
     lv_obj_t *next = screen_for_index(index);
     if (!next) return;
 
+    bool is_change = (index != g_screen_index) || (next != lv_scr_act());
+    if (is_change) {
+        Serial.printf("[Screen] %s -> %s (requested=%s)\n",
+                      screen_name(g_screen_index),
+                      screen_name(index),
+                      screen_name(requested_index));
+    }
+
+    uint8_t old_index = g_screen_index;
     g_screen_index = index;
-    if (animate) {
-        lv_scr_load_anim(next, LV_SCR_LOAD_ANIM_FADE_ON, 300, 0, false);
-    } else {
+    bool did_load = (next != lv_scr_act());
+    if (did_load) {
+        // Stop animations on the screen we're leaving (prevents LVGL dirty-area
+        // loops from inactive-screen animation callbacks on the next timer tick).
+        if (old_index == SCREEN_LOAD_GRID)     display_grid_stop_animations(GRID_METRIC_LOAD);
+        if (old_index == SCREEN_CALORIES_GRID) display_grid_stop_animations(GRID_METRIC_CALORIES);
+
         lv_scr_load(next);
+        Serial.printf("[Screen] Active: %s\n", screen_name(g_screen_index));
+
+        // Start animations on the screen we're entering.
+        if (index == SCREEN_LOAD_GRID && has_valid_dataset())
+            display_grid_start_animations(GRID_METRIC_LOAD, g_data, g_cfg);
+        if (index == SCREEN_CALORIES_GRID && has_valid_dataset())
+            display_grid_start_animations(GRID_METRIC_CALORIES, g_data, g_cfg);
+    }
+
+    if (index == SCREEN_CALORIE_TREND) {
+        refresh_trend_screen_if_needed();
+    }
+
+    if (did_load) {
+        force_screen_redraw(next);
     }
 
     if (g_screen_switch_timer) {
@@ -199,7 +353,8 @@ static void load_screen_index(uint8_t index, bool animate) {
 static void advance_to_next_screen() {
     for (int step = 0; step < SCREEN_COUNT; step++) {
         uint8_t next_index = (g_screen_index + 1 + step) % SCREEN_COUNT;
-        if (!screen_for_index(next_index)) continue;
+        if (!screen_is_available(next_index)) continue;
+        Serial.printf("[Screen] Advancing to %s\n", screen_name(next_index));
         load_screen_index(next_index, true);
         return;
     }
@@ -208,21 +363,24 @@ static void advance_to_next_screen() {
 static void screen_switch_cb(lv_timer_t *t) {
     for (int step = 0; step < SCREEN_COUNT; step++) {
         uint8_t next_index = (g_screen_index + 1 + step) % SCREEN_COUNT;
-        if (!screen_for_index(next_index)) continue;
+        if (!screen_is_available(next_index)) continue;
+        Serial.printf("[Screen] Timer flip to %s\n", screen_name(next_index));
         load_screen_index(next_index, true);
         return;
     }
 
-    lv_obj_t *next = screen_for_index(g_screen_index);
+    lv_obj_t *next = screen_for_index(first_available_screen());
     if (!next) return;
     lv_timer_set_period(t, screen_period_ms(g_screen_index));
 }
 
 static void handle_short_next_press() {
+    Serial.println("[Buttons] NEXT short press");
     advance_to_next_screen();
 }
 
 static void handle_short_info_press() {
+    Serial.println("[Buttons] INFO short press");
     show_network_overlay();
 }
 
@@ -240,9 +398,11 @@ static void button_tick(ButtonState &button, void (*short_press_cb)()) {
     if (raw_pressed != button.stable_pressed) {
         button.stable_pressed = raw_pressed;
         if (button.stable_pressed) {
+            Serial.printf("[Buttons] Pin %u pressed\n", (unsigned)button.pin);
             button.pressed_ms = now;
             button.long_press_handled = false;
         } else if (!button.long_press_handled && short_press_cb) {
+            Serial.printf("[Buttons] Pin %u released\n", (unsigned)button.pin);
             short_press_cb();
         }
         return;
@@ -250,6 +410,7 @@ static void button_tick(ButtonState &button, void (*short_press_cb)()) {
 
     if (button.stable_pressed && !button.long_press_handled && now - button.pressed_ms >= 1200) {
         button.long_press_handled = true;
+        Serial.printf("[Buttons] Pin %u long press\n", (unsigned)button.pin);
         force_device_reboot();
     }
 }
@@ -279,8 +440,8 @@ static volatile bool       g_fetch_abort = false; // ask task to stop early
 static StravaData          g_fetch_result;
 static TaskHandle_t        g_fetch_task  = nullptr;
 static portMUX_TYPE        g_fetch_task_mux = portMUX_INITIALIZER_UNLOCKED;
-static uint32_t            g_fetch_started_ms = 0;
-static uint32_t            g_fetch_abort_ms   = 0; // non-zero while waiting for task to exit
+static volatile uint32_t   g_fetch_started_ms = 0;
+static volatile uint32_t   g_fetch_abort_ms   = 0; // non-zero while waiting for task to exit
 
 static void fetch_task(void *) {
     bool ok = false;
@@ -317,19 +478,53 @@ static void apply_fetch_result(bool ok) {
     if (ok) {
         g_last_fetch_ms = millis();
         g_data = g_fetch_result;
+        g_trend_refresh_pending = true;
         if (g_display_ready) {
             Serial.println("[Apply] Calling display_grid_update...");
             display_grid_update(GRID_METRIC_LOAD, g_data, g_cfg);
+            Serial.println("[Apply] Load grid update done");
             display_grid_update(GRID_METRIC_CALORIES, g_data, g_cfg);
-            Serial.println("[Apply] display_grid_update done");
+            Serial.println("[Apply] Calories grid update done");
+            Serial.println("[Apply] Calling display_stats_update...");
             display_stats_update(g_data);
+            Serial.println("[Apply] Stats update done");
             display_stats_set_age(0);
+            Serial.println("[Apply] Age label update done");
         } else {
             Serial.println("[Apply] SKIPPED — display not ready");
         }
+        refresh_screen_selection(true);
+        // After refresh, the active screen may be a grid that needs animations started.
+        // This also covers re-fetches where load_screen_index sees no screen change.
+        if (g_screen_index == SCREEN_LOAD_GRID)
+            display_grid_start_animations(GRID_METRIC_LOAD, g_data, g_cfg);
+        else if (g_screen_index == SCREEN_CALORIES_GRID)
+            display_grid_start_animations(GRID_METRIC_CALORIES, g_data, g_cfg);
+        Serial.println("[Apply] D1");
     } else {
         Serial.println("[Fetch] All attempts failed — display not updated");
+        refresh_screen_selection(false);
     }
+
+    Serial.println("[Apply] D2");
+    update_status_screen();
+    Serial.println("[Apply] D3");
+}
+
+static void refresh_trend_screen_if_needed() {
+    if (!g_screen_calorie_trend) {
+        Serial.println("[Trend] Skip refresh - screen missing");
+        return;
+    }
+    if (!g_data.valid) {
+        Serial.println("[Trend] Skip refresh - no valid data");
+        return;
+    }
+
+    Serial.printf("[Trend] Refresh start (pending=%d)\n", (int)g_trend_refresh_pending);
+    display_calorie_trend_update(g_data);
+    g_trend_refresh_pending = false;
+    Serial.println("[Trend] Refresh done");
 }
 
 // Kick off an async fetch. If one is already running or WiFi is down, do nothing.
@@ -337,12 +532,14 @@ static void do_fetch() {
     if (g_fetch_state == FETCH_RUNNING) return;
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println("[Fetch] Skipping — WiFi not connected");
+        update_status_screen();
         return;
     }
     display_grid_stop_animations(GRID_METRIC_LOAD);
     display_grid_stop_animations(GRID_METRIC_CALORIES);
-    g_fetch_started_ms = 0;
+    g_fetch_started_ms = millis();
     g_fetch_abort_ms   = 0;
+    g_last_fetch_attempt_ms = millis();
     g_fetch_abort  = false;
     g_fetch_state  = FETCH_RUNNING;
     memset(&g_fetch_result, 0, sizeof(g_fetch_result));
@@ -350,21 +547,117 @@ static void do_fetch() {
         Serial.println("[Fetch] Task create failed — heap exhausted");
         g_fetch_state = FETCH_IDLE;
     }
+
+    update_status_screen();
+}
+
+static void refresh_screen_selection(bool prefer_primary) {
+    uint8_t target = first_available_screen();
+    if (has_valid_dataset() && prefer_primary && screen_is_available(SCREEN_LOAD_GRID)) {
+        target = SCREEN_LOAD_GRID;
+    }
+
+    if ((!screen_is_available(g_screen_index)) || (g_screen_index != target && !has_valid_dataset())) {
+        load_screen_index(target, false);
+        return;
+    }
+
+    if (g_screen_switch_timer) {
+        lv_timer_set_period(g_screen_switch_timer, screen_period_ms(g_screen_index));
+        lv_timer_reset(g_screen_switch_timer);
+    }
+}
+
+static void update_status_screen() {
+    if (!g_screen_status) return;
+
+    String title;
+    String body;
+    lv_color_t accent = lv_color_hex(0x4cc9f0);
+    const char *wifi_ssid = g_cfg.wifi_ssid[0] ? g_cfg.wifi_ssid : WIFI_SSID;
+    const char *server_url = g_cfg.strava_server_url[0] ? g_cfg.strava_server_url : "not configured";
+
+    if (WiFi.status() != WL_CONNECTED) {
+        title = "Wi-Fi offline";
+        accent = lv_color_hex(0xffb454);
+        body.reserve(196);
+        body += "Trying to reconnect to:\n";
+        body += wifi_ssid;
+        body += "\n\nStatus: ";
+        body += wifi_status_text(WiFi.status());
+        body += "\nIP: ";
+        body += current_ip_string();
+    } else if (g_fetch_state == FETCH_RUNNING && !has_valid_dataset()) {
+        title = "Loading activity";
+        accent = lv_color_hex(0x4cc9f0);
+        body.reserve(220);
+        body += "Wi-Fi: ";
+        body += current_wifi_ssid_string();
+        body += "\nIP: ";
+        body += current_ip_string();
+        body += "\n\nFetching from:\n";
+        {
+            String url_str(server_url);
+            if (url_str.length() > 34) {
+                body += url_str.substring(0, 31);
+                body += "...";
+            } else {
+                body += url_str;
+            }
+        }
+    } else if (!g_cfg.strava_server_url[0]) {
+        title = "Server not set";
+        accent = lv_color_hex(0xff8f70);
+        body = "Open the device config page and add the Strava bridge URL.";
+    } else {
+        title = "Server unavailable";
+        accent = lv_color_hex(0xff8f70);
+        body.reserve(220);
+        body += "Wi-Fi: ";
+        body += current_wifi_ssid_string();
+        body += "\nEndpoint:\n";
+        String url_str(server_url);
+        if (url_str.length() > 34) {
+            body += url_str.substring(0, 31);
+            body += "...";
+        } else {
+            body += url_str;
+        }
+        body += "\n\nNo payload received yet.";
+    }
+
+    display_status_update(title.c_str(), body.c_str(), accent);
+}
+
+static void status_screen_tick() {
+    uint32_t now = millis();
+    if (now - g_last_status_refresh_ms < 1000UL) return;
+    g_last_status_refresh_ms = now;
+    update_status_screen();
+    refresh_screen_selection(false);
+}
+
+static void bootstrap_fetch_retry_tick() {
+    static constexpr uint32_t kBootstrapRetryMs = 60000UL;
+
+    if (has_valid_dataset()) return;
+    if (g_fetch_state != FETCH_IDLE) return;
+    if (WiFi.status() != WL_CONNECTED) return;
+    if (g_last_fetch_attempt_ms != 0 && millis() - g_last_fetch_attempt_ms < kBootstrapRetryMs) return;
+    do_fetch();
 }
 
 // Called every loop iteration — checks if the fetch task finished or timed out.
 // The abort-drain window is non-blocking: we set a timestamp and return, checking
-// each loop() call whether the task has exited or the 3 s window has elapsed.
-// This keeps MQTT/web-server/LVGL alive during the drain.
+// each loop() call whether the task has exited. Do not force-delete the task
+// while HTTP/lwIP calls are active; the fetch task must unwind its own socket
+// state or lwIP can later signal a freed wait queue and assert.
 static void fetch_tick() {
     if (g_fetch_state == FETCH_IDLE) return;
 
     if (g_fetch_state == FETCH_RUNNING) {
-        if (g_fetch_started_ms == 0)
-            g_fetch_started_ms = millis() | 1u;
-
         // Non-blocking drain: if we already signalled abort, just wait for the
-        // task to null its own handle (or force-kill after 3 s).
+        // task to null its own handle after the current HTTP call times out.
         if (g_fetch_abort_ms != 0) {
             portENTER_CRITICAL(&g_fetch_task_mux);
             TaskHandle_t h = g_fetch_task;
@@ -372,17 +665,6 @@ static void fetch_tick() {
 
             if (h == nullptr) {
                 return;
-            }
-
-            if (millis() - g_fetch_abort_ms >= 3000) {
-                Serial.println("[Fetch] Force-killing stuck task");
-                portENTER_CRITICAL(&g_fetch_task_mux);
-                vTaskDelete(g_fetch_task);
-                g_fetch_task = nullptr;
-                portEXIT_CRITICAL(&g_fetch_task_mux);
-                g_fetch_state      = FETCH_DONE_FAIL;
-                g_fetch_started_ms = 0;
-                g_fetch_abort_ms   = 0;
             }
             return;
         }
@@ -414,7 +696,10 @@ static void refresh_timer_cb(lv_timer_t *) {
 
 // ── WiFi connection splash ────────────────────────────────────────────────────
 
-static void wifi_connect_splash() {
+static constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 30000;
+static constexpr uint8_t WIFI_CONNECT_MAX_RETRIES = 3;
+
+static bool wifi_connect_splash() {
     style_active_screen_black();
 
     lv_obj_t *spinner = lv_spinner_create(lv_scr_act());
@@ -434,27 +719,59 @@ static void wifi_connect_splash() {
     const char *ssid = g_cfg.wifi_ssid[0] ? g_cfg.wifi_ssid : WIFI_SSID;
     const char *pass = g_cfg.wifi_password[0] ? g_cfg.wifi_password : WIFI_PASSWORD;
 
-    lv_label_set_text_fmt(lbl, "Connecting to\n%s", ssid);
     lv_obj_align_to(lbl, spinner, LV_ALIGN_OUT_BOTTOM_MID, 0, 12);
 
     WiFi.setAutoReconnect(true);
     WiFi.persistent(false);
     WiFi.mode(WIFI_STA);
-    WiFi.begin(ssid, pass);
-    uint32_t wifi_start_ms = millis();
-    while (WiFi.status() != WL_CONNECTED) {
-        lv_timer_handler();
-        delay(50);
-        if (millis() - wifi_start_ms >= 30000) {
-            Serial.println("[WiFi] Connect timeout — continuing without WiFi");
+
+    bool connected = false;
+    for (uint8_t attempt = 1; attempt <= WIFI_CONNECT_MAX_RETRIES; ++attempt) {
+        lv_label_set_text_fmt(lbl, "Connecting to\n%s\nAttempt %u/%u",
+                              ssid,
+                              attempt,
+                              WIFI_CONNECT_MAX_RETRIES);
+
+        WiFi.disconnect(false, true);
+        delay(200);
+        WiFi.begin(ssid, pass);
+
+        uint32_t wifi_start_ms = millis();
+        while (WiFi.status() != WL_CONNECTED) {
+            wl_status_t status = WiFi.status();
+            lv_timer_handler();
+            delay(50);
+
+            if (status == WL_CONNECT_FAILED || status == WL_NO_SSID_AVAIL) {
+                Serial.printf("[WiFi] Connect attempt %u/%u failed (status=%d)\n",
+                              attempt,
+                              WIFI_CONNECT_MAX_RETRIES,
+                              (int)status);
+                break;
+            }
+
+            if (millis() - wifi_start_ms >= WIFI_CONNECT_TIMEOUT_MS) {
+                Serial.printf("[WiFi] Connect attempt %u/%u timed out\n",
+                              attempt,
+                              WIFI_CONNECT_MAX_RETRIES);
+                break;
+            }
+        }
+
+        if (WiFi.status() == WL_CONNECTED) {
+            connected = true;
+            Serial.printf("[WiFi] Connected, IP: %s\n", WiFi.localIP().toString().c_str());
             break;
         }
     }
-    if (WiFi.status() == WL_CONNECTED)
-        Serial.printf("[WiFi] Connected, IP: %s\n", WiFi.localIP().toString().c_str());
+
+    if (!connected) {
+        Serial.printf("[WiFi] Failed to connect after %u attempts\n", WIFI_CONNECT_MAX_RETRIES);
+    }
 
     lv_obj_del(spinner);
     lv_obj_del(lbl);
+    return connected;
 }
 
 // ── AP mode splash (first boot, no creds in NVS) ─────────────────────────────
@@ -476,6 +793,34 @@ static void ap_mode_splash(const char *ap_ssid) {
         "http://192.168.4.1",
         ap_ssid);
     lv_obj_align(lbl, LV_ALIGN_CENTER, 0, 0);
+}
+
+static void run_setup_ap_mode() {
+    WiFi.disconnect(true, false);
+    delay(100);
+    WiFi.mode(WIFI_AP);
+
+    bool ap_started = WiFi.softAP(kSetupApSsid, nullptr, 6, false, 4);
+    if (!ap_started) {
+        Serial.println("[WiFi] AP start failed");
+    } else {
+        Serial.printf("[WiFi] AP mode: %s @ %s\n",
+                      kSetupApSsid,
+                      WiFi.softAPIP().toString().c_str());
+    }
+
+    ap_mode_splash(kSetupApSsid);
+    web_server_start(g_cfg, [](const Config &cfg) {
+        gfx->setRotation(cfg.flip_screen ? 3 : 1);
+        set_screen_brightness_pct(cfg.brightness);
+    });
+
+    while (true) {
+        buttons_tick();
+        web_server_handle();
+        lv_timer_handler();
+        delay(5);
+    }
 }
 
 // ── LVGL init ────────────────────────────────────────────────────────────────
@@ -538,49 +883,37 @@ void setup() {
     set_screen_brightness_pct(g_cfg.brightness);
 
     if (g_cfg.wifi_ssid[0] == '\0') {
-        // No WiFi creds in NVS — start AP setup mode
-        WiFi.mode(WIFI_AP);
-        bool ap_started = WiFi.softAP(kSetupApSsid, nullptr, 6, false, 4);
-        if (!ap_started) {
-            Serial.println("[WiFi] AP start failed");
-        } else {
-            Serial.printf("[WiFi] AP mode: %s @ %s\n",
-                          kSetupApSsid,
-                          WiFi.softAPIP().toString().c_str());
-        }
-        ap_mode_splash(kSetupApSsid);
-        web_server_start(g_cfg, [](const Config &cfg) {
-            gfx->setRotation(cfg.flip_screen ? 3 : 1);
-            set_screen_brightness_pct(cfg.brightness);
-        });
-        // Stay in AP loop — web server POST /save will reboot device
-        while (true) {
-            buttons_tick();
-            web_server_handle();
-            lv_timer_handler();
-            delay(5);
-        }
+        run_setup_ap_mode();
     }
 
-    wifi_connect_splash();
+    bool wifi_connected = wifi_connect_splash();
+    if (!wifi_connected) {
+        Serial.println("[WiFi] Continuing boot without an active STA connection");
+    }
+
     web_server_start(g_cfg, [](const Config &cfg) {
         gfx->setRotation(cfg.flip_screen ? 3 : 1);
         set_screen_brightness_pct(cfg.brightness);
         mqtt_client_reinit();
-        if (g_display_ready) {
+        if (g_display_ready && g_data.valid) {
             display_grid_update(GRID_METRIC_LOAD, g_data, cfg);
             display_grid_update(GRID_METRIC_CALORIES, g_data, cfg);
+            g_trend_refresh_pending = true;
         }
     });
     mqtt_client_init(g_cfg);
 
-    g_screen_grid     = display_grid_build(GRID_METRIC_LOAD, "Exercise Load", g_cfg);
-    g_screen_stats    = display_stats_build("Exercise Load");
-    g_screen_calories = display_grid_build(GRID_METRIC_CALORIES, "Calories Burned", g_cfg);
-    g_display_ready = (g_screen_grid != nullptr && g_screen_stats != nullptr && g_screen_calories != nullptr);
-    g_screen_index = SCREEN_LOAD_GRID;
+    g_screen_status        = display_status_build();
+    g_screen_grid          = display_grid_build(GRID_METRIC_LOAD, "Exercise Load", g_cfg);
+    g_screen_stats         = display_stats_build("Exercise Load");
+    g_screen_calories      = display_grid_build(GRID_METRIC_CALORIES, "Calories Burned", g_cfg);
+    g_screen_calorie_trend = display_calorie_trend_build("7 Day Burn");
+    g_display_ready = (g_screen_status != nullptr || g_screen_grid != nullptr || g_screen_stats != nullptr ||
+                       g_screen_calories != nullptr || g_screen_calorie_trend != nullptr);
+    g_screen_index = SCREEN_STATUS;
 
-    load_screen_index(g_screen_grid ? SCREEN_LOAD_GRID : g_screen_index, false);
+    update_status_screen();
+    load_screen_index(first_available_screen(), false);
 
     if (g_display_ready) {
         do_fetch();
@@ -612,6 +945,8 @@ static void wifi_watchdog_tick() {
                           millis() - g_wifi_lost_ms, g_wifi_reconnect_count);
             g_wifi_lost_ms = 0;
             g_wifi_reconnect_count = 0;
+            g_last_fetch_attempt_ms = 0;
+            do_fetch();
         }
         return;
     }
@@ -651,6 +986,8 @@ void loop() {
     buttons_tick();
     wifi_watchdog_tick();
     fetch_tick();
+    bootstrap_fetch_retry_tick();
+    status_screen_tick();
     lv_timer_handler();
     web_server_handle();
     mqtt_client_tick();
