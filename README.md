@@ -1,17 +1,59 @@
 # Strava Exercise Load Monitor
 
-This project now drives a LilyGo T-Display S3 as a standalone Strava exercise-load dashboard. The firmware renders a 53-week activity grid and a compact stats view, while a small local bridge service reads the SQLite database produced by `statistics-for-strava` and exposes it as simple JSON for the device.
+This project now drives a LilyGo T-Display S3 as a standalone Strava exercise-load dashboard. The firmware renders multiple on-device views (status, load grid, stats, calories grid, and 7-day calorie trend), while a small local bridge service reads the SQLite database produced by `statistics-for-strava` and exposes it as simple JSON for the device.
 
 The app no longer depends on GitHub credentials, GitHub APIs, or GitHub contribution data.
 
 ## What It Does
 
-- Displays 53 weeks of daily exercise load on the T-Display S3.
-- Rotates between a heatmap screen and a stats screen.
+- Displays multiple on-device screens for status, exercise load, calories, and trends.
+- Rotates automatically through available data screens once a valid payload is received.
 - Hosts a browser-based config page for WiFi, bridge URL, brightness, animation, orientation, and MQTT topics.
 - Uses NVS so device settings survive reboots.
 - Supports an AP-based first-boot flow when WiFi is not configured.
 - Optionally exposes LCD brightness control over MQTT.
+
+## Screen Functionality
+
+The firmware uses five screen modes and switches between the ones that are currently valid:
+
+1. **Status**
+  - Shown while data is unavailable.
+  - Displays connection state, SSID/IP details, and bridge endpoint status.
+  - Covers startup, WiFi loss, and bridge-unavailable states.
+
+2. **Exercise Load Grid**
+  - 53-week heatmap source data from the bridge (minutes/day).
+  - Device renders the most recent configurable history window (`1-12` months, default `6`).
+  - Month labels and separators are shown over the visible window.
+  - Top active days can run breathing animations.
+
+3. **Exercise Stats**
+  - Three cards: current month load (hours), total active days, busiest day.
+  - Footer shows data age (for example, `updated 12m ago`).
+
+4. **Calories Grid**
+  - Same grid layout as load view, but colorized from daily calorie values.
+  - Uses the same month window and animation settings.
+
+5. **7 Day Burn (Calorie Trend)**
+  - Smoothed 7-day sparkline with weekday markers.
+  - Highlights the latest day and shows day-1 calories.
+  - Includes a simple up/down/flat marker for day-over-day change.
+
+### Rotation Behavior
+
+- Before first successful fetch: status screen remains active.
+- After valid data arrives: screen rotation includes load grid, stats, calories grid, and 7-day trend.
+- Rotation timing is intentionally weighted:
+  - stats screen uses `screen_switch_secs`
+  - all other data screens use `screen_switch_secs * 3`
+
+### Hardware Buttons
+
+- Left button (`BTN_A`) short press: move to the next available screen.
+- Right button (`BTN_B`) short press: show a temporary network overlay (IP, WiFi, AP name).
+- Long press on either button (~1.2s): reboot device.
 
 ## Architecture
 
@@ -137,8 +179,9 @@ Once the device joins your network, the config page is available at `http://<dev
 | WiFi Password | `wifi_pass` | Network password |
 | Bridge server URL | `srv_url` | Full `strava_bridge.py` endpoint URL |
 | LCD brightness | `brightness` | Display brightness from 0-100 |
-| Screen switch interval | `switch_sec` | Grid/stats rotation interval |
+| Screen switch interval | `switch_sec` | Base switch interval for screen rotation |
 | Data refresh interval | `refresh_min` | How often the device refetches data |
+| Grid history shown | `hist_months` | Visible months in grid screens (1-12) |
 | Flip screen | `flip_scr` | 180-degree rotation toggle |
 | Animation top percent | `anim_pct` | Top percentage of active days that breathe |
 | Animation period | `anim_ms` | Breathing animation period in ms |

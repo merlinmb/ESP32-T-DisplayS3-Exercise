@@ -30,12 +30,14 @@ constexpr int kSparkBot  = 94;
 constexpr int kBaseline  = 99;
 constexpr int kDotD      = 7;   // regular dot diameter
 constexpr int kTodayDotD = 11;  // emphasize most recent day
+constexpr int kTodayHaloD= kTodayDotD + 4; // radius +2px around today's filled circle
 constexpr int kCurveSamplesPerSegment = 10;
 constexpr int kCurvePtCount = (kPtCount - 1) * kCurveSamplesPerSegment + 1;
 
 static lv_obj_t  *s_screen     = nullptr;
 static lv_obj_t  *s_spark_line = nullptr;
 static lv_obj_t  *s_dots[kPtCount];
+static lv_obj_t  *s_today_halo = nullptr;
 static lv_obj_t  *s_day_labels[kPtCount];
 static lv_obj_t  *s_value      = nullptr;
 static lv_obj_t  *s_delta_wrap = nullptr;
@@ -226,6 +228,19 @@ lv_obj_t *display_calorie_trend_build(const char *title) {
         lv_obj_set_pos(s_day_labels[i], pt_x(i) - 6, kBaseline + 6);
     }
 
+    // 1px white halo ring around today's marker (radius +2px compared to fill)
+    s_today_halo = lv_obj_create(chart_card);
+    lv_obj_remove_style_all(s_today_halo);
+    lv_obj_set_size(s_today_halo, kTodayHaloD, kTodayHaloD);
+    lv_obj_set_style_radius(s_today_halo, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(s_today_halo, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_today_halo, 1, 0);
+    lv_obj_set_style_border_color(s_today_halo, lv_color_white(), 0);
+    lv_obj_set_style_border_opa(s_today_halo, LV_OPA_COVER, 0);
+    lv_obj_set_pos(s_today_halo,
+                   pt_x(kPtCount - 1) - kTodayHaloD / 2,
+                   pt_y(0.5f) - kTodayHaloD / 2);
+
     // Summary card
     lv_obj_t *summary = lv_obj_create(s_screen);
     lv_obj_set_size(summary, kSummaryW, kSummaryH);
@@ -330,6 +345,9 @@ void display_calorie_trend_update(const StravaData &data) {
         s_pts[i].x = px;
         s_pts[i].y = py;
         lv_obj_set_pos(s_dots[i], px - dot_d / 2, py - dot_d / 2);
+        if (i == (kPtCount - 1) && s_today_halo) {
+            lv_obj_set_pos(s_today_halo, px - kTodayHaloD / 2, py - kTodayHaloD / 2);
+        }
         lv_label_set_text(s_day_labels[i],
                           weekday_short(weekday_sun0(ref - (kPtCount - 1 - i))));
     }
