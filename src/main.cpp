@@ -32,6 +32,7 @@ static bool       g_trend_refresh_pending = true;
 static lv_display_t *disp = nullptr;
 static lv_color_t *g_lvgl_buf = nullptr;
 static lv_obj_t  *g_network_overlay = nullptr;
+static lv_obj_t  *g_network_overlay_label = nullptr;
 static lv_timer_t *g_network_overlay_timer = nullptr;
 static uint32_t   g_last_status_refresh_ms = 0;
 
@@ -137,13 +138,11 @@ static void style_active_screen_black() {
 }
 
 static void hide_network_overlay() {
-    if (g_network_overlay_timer) {
-        lv_timer_delete(g_network_overlay_timer);
-        g_network_overlay_timer = nullptr;
-    }
+    if (g_network_overlay_timer) lv_timer_pause(g_network_overlay_timer);
     if (g_network_overlay) {
         lv_obj_del(g_network_overlay);
         g_network_overlay = nullptr;
+        g_network_overlay_label = nullptr;
     }
 }
 
@@ -173,12 +172,15 @@ static String current_ap_name_string() {
 }
 
 static void network_overlay_timeout_cb(lv_timer_t *) {
-    hide_network_overlay();
+    if (g_network_overlay) {
+        lv_obj_del(g_network_overlay);
+        g_network_overlay = nullptr;
+        g_network_overlay_label = nullptr;
+    }
+    if (g_network_overlay_timer) lv_timer_pause(g_network_overlay_timer);
 }
 
 static void show_network_overlay() {
-    hide_network_overlay();
-
     String text;
     text.reserve(128);
     text += "IP: ";
@@ -188,28 +190,39 @@ static void show_network_overlay() {
     text += "\nAP: ";
     text += current_ap_name_string();
 
-    lv_obj_t *overlay = lv_obj_create(lv_layer_top());
-    g_network_overlay = overlay;
-    lv_obj_set_size(overlay, 280, LV_SIZE_CONTENT);
-    lv_obj_set_style_bg_color(overlay, lv_color_hex(0x101820), 0);
-    lv_obj_set_style_bg_opa(overlay, LV_OPA_90, 0);
-    lv_obj_set_style_border_width(overlay, 1, 0);
-    lv_obj_set_style_border_color(overlay, lv_color_hex(0x39d353), 0);
-    lv_obj_set_style_radius(overlay, 12, 0);
-    lv_obj_set_style_pad_hor(overlay, 12, 0);
-    lv_obj_set_style_pad_ver(overlay, 10, 0);
-    lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_align(overlay, LV_ALIGN_TOP_MID, 0, 12);
+    if (!g_network_overlay) {
+        lv_obj_t *overlay = lv_obj_create(lv_layer_top());
+        g_network_overlay = overlay;
+        lv_obj_set_size(overlay, 280, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(overlay, lv_color_hex(0x101820), 0);
+        lv_obj_set_style_bg_opa(overlay, LV_OPA_90, 0);
+        lv_obj_set_style_border_width(overlay, 1, 0);
+        lv_obj_set_style_border_color(overlay, lv_color_hex(0x39d353), 0);
+        lv_obj_set_style_radius(overlay, 12, 0);
+        lv_obj_set_style_pad_hor(overlay, 12, 0);
+        lv_obj_set_style_pad_ver(overlay, 10, 0);
+        lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_align(overlay, LV_ALIGN_TOP_MID, 0, 12);
 
-    lv_obj_t *label = lv_label_create(overlay);
-    lv_obj_set_width(label, 256);
-    lv_obj_set_style_text_color(label, lv_color_white(), 0);
-    lv_obj_set_style_text_font(label, ui_font_label(), 0);
-    lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
-    lv_label_set_text(label, text.c_str());
-    lv_obj_center(label);
+        lv_obj_t *label = lv_label_create(overlay);
+        g_network_overlay_label = label;
+        lv_obj_set_width(label, 256);
+        lv_obj_set_style_text_color(label, lv_color_white(), 0);
+        lv_obj_set_style_text_font(label, ui_font_label(), 0);
+        lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+        lv_obj_center(label);
+    }
 
-    g_network_overlay_timer = lv_timer_create(network_overlay_timeout_cb, 4000, nullptr);
+    if (g_network_overlay_label) {
+        lv_label_set_text(g_network_overlay_label, text.c_str());
+    }
+
+    if (!g_network_overlay_timer) {
+        g_network_overlay_timer = lv_timer_create(network_overlay_timeout_cb, 4000, nullptr);
+    }
+    lv_timer_set_period(g_network_overlay_timer, 4000);
+    lv_timer_resume(g_network_overlay_timer);
+    lv_timer_reset(g_network_overlay_timer);
 }
 
 static void force_device_reboot() {
@@ -292,10 +305,25 @@ void set_screen_brightness_pct(uint8_t pct) {
 // Grid screens stay visible 3x longer than stats to give the activity view priority.
 
 static lv_timer_t *g_screen_switch_timer = nullptr;
+static void sync_screen_switch_timer() {
+    if (!g_screen_switch_timer) return;
+    lv_timer_set_period(g_screen_switch_timer, screen_period_ms(g_screen_index));
+    lv_timer_reset(g_screen_switch_timer);
+}
 
 static void force_screen_redraw(lv_obj_t *scr) {
     if (!scr) return;
     lv_obj_invalidate(scr);
+}
+
+static bool select_next_available_screen(uint8_t current, uint8_t &next_index) {
+    for (int step = 0; step < SCREEN_COUNT; step++) {
+        uint8_t candidate = (current + 1 + step) % SCREEN_COUNT;
+        if (!screen_is_available(candidate)) continue;
+        next_index = candidate;
+        return true;
+    }
+    return false;
 }
 
 static void load_screen_index(uint8_t index, bool animate) {
@@ -344,26 +372,19 @@ static void load_screen_index(uint8_t index, bool animate) {
         force_screen_redraw(next);
     }
 
-    if (g_screen_switch_timer) {
-        lv_timer_set_period(g_screen_switch_timer, screen_period_ms(g_screen_index));
-        lv_timer_reset(g_screen_switch_timer);
-    }
+    sync_screen_switch_timer();
 }
 
 static void advance_to_next_screen() {
-    for (int step = 0; step < SCREEN_COUNT; step++) {
-        uint8_t next_index = (g_screen_index + 1 + step) % SCREEN_COUNT;
-        if (!screen_is_available(next_index)) continue;
-        Serial.printf("[Screen] Advancing to %s\n", screen_name(next_index));
-        load_screen_index(next_index, true);
-        return;
-    }
+    uint8_t next_index = 0;
+    if (!select_next_available_screen(g_screen_index, next_index)) return;
+    Serial.printf("[Screen] Advancing to %s\n", screen_name(next_index));
+    load_screen_index(next_index, true);
 }
 
 static void screen_switch_cb(lv_timer_t *t) {
-    for (int step = 0; step < SCREEN_COUNT; step++) {
-        uint8_t next_index = (g_screen_index + 1 + step) % SCREEN_COUNT;
-        if (!screen_is_available(next_index)) continue;
+    uint8_t next_index = 0;
+    if (select_next_available_screen(g_screen_index, next_index)) {
         Serial.printf("[Screen] Timer flip to %s\n", screen_name(next_index));
         load_screen_index(next_index, true);
         return;
@@ -560,11 +581,6 @@ static void refresh_screen_selection(bool prefer_primary) {
     if ((!screen_is_available(g_screen_index)) || (g_screen_index != target && !has_valid_dataset())) {
         load_screen_index(target, false);
         return;
-    }
-
-    if (g_screen_switch_timer) {
-        lv_timer_set_period(g_screen_switch_timer, screen_period_ms(g_screen_index));
-        lv_timer_reset(g_screen_switch_timer);
     }
 }
 
@@ -900,6 +916,7 @@ void setup() {
             display_grid_update(GRID_METRIC_CALORIES, g_data, cfg);
             g_trend_refresh_pending = true;
         }
+        sync_screen_switch_timer();
     });
     mqtt_client_init(g_cfg);
 

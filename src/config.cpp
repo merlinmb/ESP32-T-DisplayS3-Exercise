@@ -6,7 +6,7 @@ static Preferences prefs;
 void config_apply_defaults(Config &cfg) {
     // Clamp brightness: 0 is a valid off state, values >100 reset to 100 %.
     if (cfg.brightness > 100) cfg.brightness = 100;
-    if (cfg.screen_switch_secs == 0)   cfg.screen_switch_secs   = 30;
+    if (cfg.screen_switch_secs == 0)   cfg.screen_switch_secs   = 15;
     if (cfg.refresh_interval_min == 0) cfg.refresh_interval_min = 30;
     if (cfg.history_months < kMinHistoryMonths || cfg.history_months > kMaxHistoryMonths)
         cfg.history_months = kDefaultHistoryMonths;
