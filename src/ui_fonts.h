@@ -1,8 +1,2 @@
-#pragma once
-
-#include <lvgl.h>
-
-bool ui_fonts_init();
-
-const lv_font_t *ui_font_label();
-const lv_font_t *ui_font_stat();
+﻿#pragma once
+// ui_fonts.h -- stub; TFT_eSPI uses built-in fonts via setTextFont().

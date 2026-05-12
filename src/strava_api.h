@@ -8,11 +8,11 @@
 
 struct ExerciseDay {
     float   load;            // moving time in minutes for this day
-    uint8_t load_level;      // 0 = none | 1 = low (<50) | 2 = medium (<100)
-                            // 3 = high (<150) | 4 = very high (>=150)
+    uint8_t load_level;      // 0 = none | 1 = low (1-30) | 2 = medium (31-60)
+                            // 3 = high (61-120) | 4 = very high (>120)
     float   calories;        // calories burned for this day
-    uint8_t calories_level;  // 0 = none | 1 = light (<250) | 2 = medium (<500)
-                            // 3 = high (<750) | 4 = very high (>=750)
+    uint8_t calories_level;  // 0 = none | 1 = low (1-500) | 2 = medium (501-750)
+                            // 3 = high (751-1000) | 4 = very high (>1000)
 };
 
 // ── Full dataset (53 weeks x 7 days) ─────────────────────────────────────────

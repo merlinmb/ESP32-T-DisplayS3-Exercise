@@ -1,12 +1,8 @@
 #pragma once
-#include <lvgl.h>
+#include "display.h"
 #include "strava_api.h"
 
-// Build the stats screen. Call once after LVGL init.
-lv_obj_t *display_stats_build(const char *title);
-
-// Update labels from fresh data.
-void display_stats_update(const StravaData &data);
-
-// Update the "last updated Xm ago" footer. Call with minutes since last fetch.
-void display_stats_set_age(uint32_t minutes_ago);
+// Render the stats summary screen into the provided sprite.
+// age_minutes: minutes since the last successful data fetch.
+void display_stats_render(TFT_eSprite &spr, const StravaData &data,
+                          uint32_t age_minutes);

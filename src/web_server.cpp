@@ -172,6 +172,10 @@ static void handle_root() {
     server.send(200, "text/html", build_page());
 }
 
+static void handle_health() {
+    server.send(200, "text/plain", "ok");
+}
+
 static void handle_save() {
     if (server.method() != HTTP_POST) {
         server.send(405, "text/plain", "Method Not Allowed");
@@ -237,6 +241,7 @@ void web_server_start(Config &cfg, ConfigApplyFn on_apply) {
     s_cfg      = &cfg;
     s_apply_fn = on_apply;
     server.on("/",       HTTP_GET,  handle_root);
+    server.on("/health", HTTP_GET,  handle_health);
     server.on("/save",   HTTP_POST, handle_save);
     server.on("/reboot", HTTP_POST, handle_reboot);
     server.on("/reset",  HTTP_POST, handle_reset);

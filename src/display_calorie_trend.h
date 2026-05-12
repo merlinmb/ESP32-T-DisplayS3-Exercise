@@ -1,7 +1,6 @@
 #pragma once
-
-#include <lvgl.h>
+#include "display.h"
 #include "strava_api.h"
 
-lv_obj_t *display_calorie_trend_build(const char *title);
-void display_calorie_trend_update(const StravaData &data);
+// Render the 7-day calorie sparkline screen into the provided sprite.
+void display_calorie_trend_render(TFT_eSprite &spr, const StravaData &data);

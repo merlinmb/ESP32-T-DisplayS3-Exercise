@@ -1,68 +1,65 @@
-#include "display_calorie_trend.h"
-#include "ui_fonts.h"
-
+﻿#include "display_calorie_trend.h"
 #include <Arduino.h>
 #include <math.h>
 
-namespace {
+// ── Layout constants ──────────────────────────────────────────────────────────
+// Screen 320×170.  Chart card fills from left (1px pad) to just before summary.
+// Summary card flush to the right edge (1px pad).
+static const int kSummaryW   =  84;
+static const int kSummaryH   = 137;
+static const int kSummaryX   = DISP_W - kSummaryW - 1;  // 235
+static const int kSummaryY   =   4;
 
-constexpr int kScreenW   = 320;
-constexpr int kScreenH   = 170;
+static const int kChartX     =   1;
+static const int kChartY     =   4;   // top-aligned with summary card
+static const int kChartW     = kSummaryX - kChartX - 4;  // 230 (4px gap)
+static const int kChartH     = 137;
 
-// Chart card — wider and taller, pushed left/up
-constexpr int kChartW    = 218;
-constexpr int kChartH    = 140;
-constexpr int kChartX    = -8;
-constexpr int kChartY    = 1;
+static const int kPtCount    =  7;
+// Spark content inside chart card: pushed right & down to clear rounded corners
+static const int kSparkLeft  = 15;   // was 7
+static const int kSparkRight = 210;  // was 189
+static const int kSparkTop   = 10;   // was 4
+static const int kSparkBot   = 100;  // was 94  (+6 to match top shift)
+static const int kBaseline   = 105;  // was 99  (+6 to match top shift)
+static const int kDotD       =  7;
+static const int kTodayDotD  = 11;
+static const int kTodayHaloD = 15;  // kTodayDotD + 4
+static const int kCurveSamplesPerSegment = 10;
+static const int kCurvePtCount = (kPtCount - 1) * kCurveSamplesPerSegment + 1;
 
-// Summary card — expanded to use available screen space
-constexpr int kSummaryW  = 84;
-constexpr int kSummaryH  = 140;
-constexpr int kSummaryX  = 230;
-constexpr int kSummaryY  = 6;
+// ── Point struct (replaces lv_point_precise_t) ───────────────────────────────
+struct Pt { float x; float y; };
 
-// Sparkline geometry (coords within chart card)
-constexpr int kPtCount   = 7;
-constexpr int kSparkLeft = 7;
-constexpr int kSparkRight= 189;
-constexpr int kSparkTop  = 4;
-constexpr int kSparkBot  = 94;
-constexpr int kBaseline  = 99;
-constexpr int kDotD      = 7;   // regular dot diameter
-constexpr int kTodayDotD = 11;  // emphasize most recent day
-constexpr int kTodayHaloD= kTodayDotD + 4; // radius +2px around today's filled circle
-constexpr int kCurveSamplesPerSegment = 10;
-constexpr int kCurvePtCount = (kPtCount - 1) * kCurveSamplesPerSegment + 1;
+// ── Calorie level colour ──────────────────────────────────────────────────────
+static uint16_t cal_level_color(uint8_t level) {
+    static const uint16_t kColors[5] = {
+        RGB565(0x17, 0x1B, 0x20),   // 0 grey
+        RGB565(0x27, 0xAE, 0x60),   // 1 green
+        RGB565(0xF1, 0xC4, 0x0F),   // 2 yellow
+        RGB565(0xE6, 0x7E, 0x22),   // 3 orange
+        RGB565(0xE7, 0x4C, 0x3C),   // 4 red
+    };
+    if (level > 4) level = 4;
+    return kColors[level];
+}
 
-static lv_obj_t  *s_screen     = nullptr;
-static lv_obj_t  *s_spark_line = nullptr;
-static lv_obj_t  *s_dots[kPtCount];
-static lv_obj_t  *s_today_halo = nullptr;
-static lv_obj_t  *s_day_labels[kPtCount];
-static lv_obj_t  *s_value      = nullptr;
-static lv_obj_t  *s_delta_wrap = nullptr;
-static lv_obj_t  *s_delta_up[3];
-static lv_obj_t  *s_delta_down[3];
-static lv_obj_t  *s_delta_flat = nullptr;
-static lv_obj_t  *s_title      = nullptr;
-static lv_point_precise_t s_pts[kPtCount];
-static lv_point_precise_t s_curve_pts[kCurvePtCount];
+// ── Calendar helpers ──────────────────────────────────────────────────────────
+static uint8_t weekday_sun0(int32_t d) {
+    int w = (int)((d + 4) % 7);
+    if (w < 0) w += 7;
+    return (uint8_t)w;
+}
 
 static const char *weekday_short(uint8_t d) {
     static const char *kL[7] = {"S","M","T","W","T","F","S"};
     return kL[(d < 7) ? d : 0];
 }
 
-static uint8_t weekday_sun0(int32_t days) {
-    int w = (int)((days + 4) % 7);
-    if (w < 0) w += 7;
-    return (uint8_t)w;
-}
-
 static bool day_calories(const StravaData &data, int32_t day_epoch, float &cal) {
     if (data.anchor_week_start_days == 0) return false;
     uint8_t wd    = weekday_sun0(day_epoch);
-    int32_t ws    = day_epoch - wd;
+    int32_t ws    = day_epoch - (int32_t)wd;
     int32_t delta = data.anchor_week_start_days - ws;
     if (delta < 0 || (delta % 7) != 0) return false;
     int wk = (int)(delta / 7);
@@ -71,6 +68,7 @@ static bool day_calories(const StravaData &data, int32_t day_epoch, float &cal) 
     return true;
 }
 
+// ── Sparkline geometry helpers ────────────────────────────────────────────────
 static int pt_x(int i) {
     return kSparkLeft + (i * (kSparkRight - kSparkLeft)) / (kPtCount - 1);
 }
@@ -79,249 +77,78 @@ static int pt_y(float norm) {
     return kSparkTop + (int)lroundf((1.0f - norm) * (float)(kSparkBot - kSparkTop));
 }
 
+// ── Catmull-Rom spline ────────────────────────────────────────────────────────
+static Pt s_pts[kPtCount];
+static Pt s_curve_pts[kCurvePtCount];
+
 static void rebuild_smooth_curve_points() {
     int out_idx = 0;
-
     for (int i = 0; i < (kPtCount - 1); ++i) {
-        const lv_point_precise_t p0 = s_pts[(i == 0) ? 0 : (i - 1)];
-        const lv_point_precise_t p1 = s_pts[i];
-        const lv_point_precise_t p2 = s_pts[i + 1];
-        const lv_point_precise_t p3 = s_pts[(i + 2 < kPtCount) ? (i + 2) : (kPtCount - 1)];
+        const Pt p0 = s_pts[(i == 0) ? 0 : (i - 1)];
+        const Pt p1 = s_pts[i];
+        const Pt p2 = s_pts[i + 1];
+        const Pt p3 = s_pts[(i + 2 < kPtCount) ? (i + 2) : (kPtCount - 1)];
 
-        const float cp1x = (float)p1.x + ((float)p2.x - (float)p0.x) / 6.0f;
-        const float cp1y = (float)p1.y + ((float)p2.y - (float)p0.y) / 6.0f;
-        const float cp2x = (float)p2.x - ((float)p3.x - (float)p1.x) / 6.0f;
-        const float cp2y = (float)p2.y - ((float)p3.y - (float)p1.y) / 6.0f;
+        const float cp1x = p1.x + (p2.x - p0.x) / 6.0f;
+        const float cp1y = p1.y + (p2.y - p0.y) / 6.0f;
+        const float cp2x = p2.x - (p3.x - p1.x) / 6.0f;
+        const float cp2y = p2.y - (p3.y - p1.y) / 6.0f;
 
         for (int s = 0; s < kCurveSamplesPerSegment; ++s) {
             const float t = (float)s / (float)kCurveSamplesPerSegment;
             const float u = 1.0f - t;
-
-            const float bx =
-                u * u * u * (float)p1.x +
-                3.0f * u * u * t * cp1x +
-                3.0f * u * t * t * cp2x +
-                t * t * t * (float)p2.x;
-            const float by =
-                u * u * u * (float)p1.y +
-                3.0f * u * u * t * cp1y +
-                3.0f * u * t * t * cp2y +
-                t * t * t * (float)p2.y;
-
-            s_curve_pts[out_idx].x = (lv_value_precise_t)lroundf(bx);
-            s_curve_pts[out_idx].y = (lv_value_precise_t)lroundf(by);
+            s_curve_pts[out_idx].x = u*u*u*p1.x + 3.0f*u*u*t*cp1x +
+                                     3.0f*u*t*t*cp2x + t*t*t*p2.x;
+            s_curve_pts[out_idx].y = u*u*u*p1.y + 3.0f*u*u*t*cp1y +
+                                     3.0f*u*t*t*cp2y + t*t*t*p2.y;
             out_idx++;
         }
     }
-
     s_curve_pts[out_idx] = s_pts[kPtCount - 1];
 }
 
-static void style_delta_segment(lv_obj_t *obj, lv_color_t color) {
-    lv_obj_remove_style_all(obj);
-    lv_obj_set_style_bg_color(obj, color, 0);
-    lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(obj, 0, 0);
-    lv_obj_clear_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
-}
-
-static void set_delta_marker(float delta) {
-    if (!s_delta_wrap || !s_delta_flat) return;
-
-    const lv_color_t up_color = lv_color_hex(0x32cd32);
-    const lv_color_t down_color = lv_color_hex(0xff4d4f);
-    const lv_color_t flat_color = lv_color_hex(0xb0bec5);
-
+// ── Delta marker helpers ──────────────────────────────────────────────────────
+// Draw a simple 3-row filled triangle or flat bar in the summary card.
+// wx,wy = top-left corner of the 16×10 marker area within the sprite.
+static void draw_delta_marker(TFT_eSprite &spr, int wx, int wy, float delta) {
     if (delta > 0.5f) {
-        for (int i = 0; i < 3; ++i) {
-            lv_obj_clear_flag(s_delta_up[i], LV_OBJ_FLAG_HIDDEN);
-            lv_obj_add_flag(s_delta_down[i], LV_OBJ_FLAG_HIDDEN);
-            lv_obj_set_style_bg_color(s_delta_up[i], up_color, 0);
-        }
-        lv_obj_add_flag(s_delta_flat, LV_OBJ_FLAG_HIDDEN);
+        // Up triangle: rows narrow from bottom to top
+        static const int up_w[3] = {13, 9, 5};
+        uint16_t col = RGB565(0x32, 0xCD, 0x32);
+        for (int r = 0; r < 3; r++)
+            spr.fillRect(wx + (16 - up_w[r]) / 2, wy + (2 - r) * 3, up_w[r], 2, col);
     } else if (delta < -0.5f) {
-        for (int i = 0; i < 3; ++i) {
-            lv_obj_add_flag(s_delta_up[i], LV_OBJ_FLAG_HIDDEN);
-            lv_obj_clear_flag(s_delta_down[i], LV_OBJ_FLAG_HIDDEN);
-            lv_obj_set_style_bg_color(s_delta_down[i], down_color, 0);
-        }
-        lv_obj_add_flag(s_delta_flat, LV_OBJ_FLAG_HIDDEN);
+        // Down triangle: rows narrow from top to bottom
+        static const int dn_w[3] = {13, 9, 5};
+        uint16_t col = RGB565(0xFF, 0x4D, 0x4F);
+        for (int r = 0; r < 3; r++)
+            spr.fillRect(wx + (16 - dn_w[r]) / 2, wy + r * 3, dn_w[r], 2, col);
     } else {
-        for (int i = 0; i < 3; ++i) {
-            lv_obj_add_flag(s_delta_up[i], LV_OBJ_FLAG_HIDDEN);
-            lv_obj_add_flag(s_delta_down[i], LV_OBJ_FLAG_HIDDEN);
-        }
-        lv_obj_clear_flag(s_delta_flat, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_set_style_bg_color(s_delta_flat, flat_color, 0);
+        // Flat bar
+        spr.fillRect(wx + 2, wy + 4, 12, 2, RGB565(0xB0, 0xBE, 0xC5));
     }
 }
 
-} // namespace
+// ── Main render ───────────────────────────────────────────────────────────────
+void display_calorie_trend_render(TFT_eSprite &spr, const StravaData &data) {
+    // ── Chart card ────────────────────────────────────────────────────────────
+    spr.fillRoundRect(kChartX, kChartY, kChartW, kChartH, 22,
+                      RGB565(0x0B, 0x13, 0x1A));
+    spr.drawRoundRect(kChartX, kChartY, kChartW, kChartH, 22,
+                      RGB565(0x1F, 0x2D, 0x39));
 
-lv_obj_t *display_calorie_trend_build(const char *title) {
-    s_screen = lv_obj_create(nullptr);
-    lv_obj_set_size(s_screen, kScreenW, kScreenH);
-    lv_obj_set_style_bg_color(s_screen, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(s_screen, LV_OPA_COVER, 0);
-    lv_obj_clear_flag(s_screen, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t *chart_card = lv_obj_create(s_screen);
-    lv_obj_set_size(chart_card, kChartW, kChartH);
-    lv_obj_set_pos(chart_card, kChartX, kChartY);
-    lv_obj_set_style_radius(chart_card, 22, 0);
-    lv_obj_set_style_bg_color(chart_card, lv_color_hex(0x0b131a), 0);
-    lv_obj_set_style_bg_opa(chart_card, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(chart_card, 1, 0);
-    lv_obj_set_style_border_color(chart_card, lv_color_hex(0x1f2d39), 0);
-    lv_obj_clear_flag(chart_card, LV_OBJ_FLAG_SCROLLABLE);
-
-    // Subtle horizontal guide lines
+    // Guide lines (3 horizontal)
     const int kSpan = kSparkRight - kSparkLeft;
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 3; i++) {
         int gy = kSparkTop + i * (kSparkBot - kSparkTop) / 2;
-        lv_obj_t *g = lv_obj_create(chart_card);
-        lv_obj_remove_style_all(g);
-        lv_obj_set_size(g, kSpan, 1);
-        lv_obj_set_style_bg_color(g, lv_color_hex(0x173042), 0);
-        lv_obj_set_style_bg_opa(g, LV_OPA_40, 0);
-        lv_obj_set_pos(g, kSparkLeft, gy);
+        spr.drawFastHLine(kChartX + kSparkLeft, kChartY + gy,
+                          kSpan, RGB565(0x17, 0x30, 0x42));
     }
-
     // Baseline
-    lv_obj_t *baseline = lv_obj_create(chart_card);
-    lv_obj_remove_style_all(baseline);
-    lv_obj_set_size(baseline, kSpan, 2);
-    lv_obj_set_style_bg_color(baseline, lv_color_hex(0x2d4658), 0);
-    lv_obj_set_style_bg_opa(baseline, LV_OPA_70, 0);
-    lv_obj_set_pos(baseline, kSparkLeft, kBaseline);
+    spr.fillRect(kChartX + kSparkLeft, kChartY + kBaseline,
+                 kSpan, 2, RGB565(0x2D, 0x46, 0x58));
 
-    // Sparkline (lv_line) — init with flat midline placeholder
-    for (int i = 0; i < kPtCount; ++i) {
-        s_pts[i].x = pt_x(i);
-        s_pts[i].y = pt_y(0.5f);
-    }
-    rebuild_smooth_curve_points();
-    s_spark_line = lv_line_create(chart_card);
-    lv_line_set_points(s_spark_line, s_curve_pts, kCurvePtCount);
-    lv_obj_set_style_line_color(s_spark_line, lv_color_hex(0x4cc9f0), 0);
-    lv_obj_set_style_line_width(s_spark_line, 2, 0);
-    lv_obj_set_style_line_rounded(s_spark_line, true, 0);
-    lv_obj_set_pos(s_spark_line, 0, 0);
-
-    // Dot markers + weekday labels
-    for (int i = 0; i < kPtCount; ++i) {
-        const int dot_d = (i == (kPtCount - 1)) ? kTodayDotD : kDotD;
-        s_dots[i] = lv_obj_create(chart_card);
-        lv_obj_remove_style_all(s_dots[i]);
-        lv_obj_set_size(s_dots[i], dot_d, dot_d);
-        lv_obj_set_style_radius(s_dots[i], LV_RADIUS_CIRCLE, 0);
-        lv_obj_set_style_bg_color(s_dots[i], lv_color_hex(0x4cc9f0), 0);
-        lv_obj_set_style_bg_opa(s_dots[i], LV_OPA_COVER, 0);
-        lv_obj_set_pos(s_dots[i], pt_x(i) - dot_d / 2, pt_y(0.5f) - dot_d / 2);
-
-        s_day_labels[i] = lv_label_create(chart_card);
-        lv_obj_set_width(s_day_labels[i], 12);
-        lv_obj_set_style_text_font(s_day_labels[i], ui_font_label(), 0);
-        lv_obj_set_style_text_color(s_day_labels[i], lv_color_hex(0x9cb0c1), 0);
-        lv_obj_set_style_text_align(s_day_labels[i], LV_TEXT_ALIGN_CENTER, 0);
-        lv_label_set_text(s_day_labels[i], "-");
-        lv_obj_set_pos(s_day_labels[i], pt_x(i) - 6, kBaseline + 6);
-    }
-
-    // 1px white halo ring around today's marker (radius +2px compared to fill)
-    s_today_halo = lv_obj_create(chart_card);
-    lv_obj_remove_style_all(s_today_halo);
-    lv_obj_set_size(s_today_halo, kTodayHaloD, kTodayHaloD);
-    lv_obj_set_style_radius(s_today_halo, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_opa(s_today_halo, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(s_today_halo, 1, 0);
-    lv_obj_set_style_border_color(s_today_halo, lv_color_white(), 0);
-    lv_obj_set_style_border_opa(s_today_halo, LV_OPA_COVER, 0);
-    lv_obj_set_pos(s_today_halo,
-                   pt_x(kPtCount - 1) - kTodayHaloD / 2,
-                   pt_y(0.5f) - kTodayHaloD / 2);
-
-    // Summary card
-    lv_obj_t *summary = lv_obj_create(s_screen);
-    lv_obj_set_size(summary, kSummaryW, kSummaryH);
-    lv_obj_set_pos(summary, kSummaryX, kSummaryY);
-    lv_obj_set_style_radius(summary, 20, 0);
-    lv_obj_set_style_bg_color(summary, lv_color_hex(0x111a22), 0);
-    lv_obj_set_style_bg_opa(summary, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(summary, 1, 0);
-    lv_obj_set_style_border_color(summary, lv_color_hex(0x263746), 0);
-    lv_obj_set_style_pad_all(summary, 0, 0);
-    lv_obj_clear_flag(summary, LV_OBJ_FLAG_SCROLLABLE);
-
-    // Day header centered at the top of the summary card
-    lv_obj_t *vert = lv_label_create(summary);
-    lv_obj_set_style_text_font(vert, ui_font_label(), 0);
-    lv_obj_set_style_text_color(vert, lv_color_hex(0x7fd6f8), 0);
-    lv_obj_set_style_text_align(vert, LV_TEXT_ALIGN_CENTER, 0);
-    lv_label_set_text(vert, "day - 1");
-    lv_obj_align(vert, LV_ALIGN_TOP_MID, 0, 6);
-
-    // Previous-day calorie value centered in the summary card
-    s_value = lv_label_create(summary);
-    lv_obj_set_style_text_font(s_value, ui_font_stat(), 0);
-    lv_obj_set_style_text_color(s_value, lv_color_white(), 0);
-    lv_obj_set_style_text_align(s_value, LV_TEXT_ALIGN_CENTER, 0);
-    lv_label_set_text(s_value, "0");
-    lv_obj_align(s_value, LV_ALIGN_CENTER, 0, -12);
-
-    // Day-over-day marker under the value (manual filled triangle/bar)
-    s_delta_wrap = lv_obj_create(summary);
-    lv_obj_remove_style_all(s_delta_wrap);
-    lv_obj_set_size(s_delta_wrap, 16, 10);
-    lv_obj_align_to(s_delta_wrap, s_value, LV_ALIGN_OUT_BOTTOM_MID, 0, 7);
-    lv_obj_clear_flag(s_delta_wrap, LV_OBJ_FLAG_SCROLLABLE);
-
-    const int up_w[3] = {5, 9, 13};
-    const int down_w[3] = {13, 9, 5};
-    for (int i = 0; i < 3; ++i) {
-        s_delta_up[i] = lv_obj_create(s_delta_wrap);
-        style_delta_segment(s_delta_up[i], lv_color_hex(0x32cd32));
-        lv_obj_set_size(s_delta_up[i], up_w[i], 2);
-        lv_obj_set_pos(s_delta_up[i], (16 - up_w[i]) / 2, i * 3);
-
-        s_delta_down[i] = lv_obj_create(s_delta_wrap);
-        style_delta_segment(s_delta_down[i], lv_color_hex(0xff4d4f));
-        lv_obj_set_size(s_delta_down[i], down_w[i], 2);
-        lv_obj_set_pos(s_delta_down[i], (16 - down_w[i]) / 2, i * 3);
-    }
-
-    s_delta_flat = lv_obj_create(s_delta_wrap);
-    style_delta_segment(s_delta_flat, lv_color_hex(0xb0bec5));
-    lv_obj_set_size(s_delta_flat, 12, 2);
-    lv_obj_set_pos(s_delta_flat, 2, 4);
-    set_delta_marker(0.0f);
-
-    lv_obj_t *unit = lv_label_create(summary);
-    lv_obj_set_style_text_font(unit, ui_font_label(), 0);
-    lv_obj_set_style_text_color(unit, lv_color_hex(0x9cb0c1), 0);
-    lv_obj_set_style_text_align(unit, LV_TEXT_ALIGN_CENTER, 0);
-    lv_label_set_text(unit, "k.cal");
-    lv_obj_update_layout(s_screen);
-    lv_area_t axis_label_area;
-    lv_area_t summary_area;
-    lv_obj_get_coords(s_day_labels[0], &axis_label_area);
-    lv_obj_get_coords(summary, &summary_area);
-    const int unit_y = axis_label_area.y1 - summary_area.y1;
-    const int unit_x = (kSummaryW - lv_obj_get_width(unit)) / 2;
-    lv_obj_set_pos(unit, unit_x, unit_y);
-
-    s_title = lv_label_create(s_screen);
-    lv_obj_set_style_text_font(s_title, ui_font_label(), 0);
-    lv_obj_set_style_text_color(s_title, lv_color_hex(0xfc4c02), 0);
-    lv_label_set_text(s_title, title ? title : "Calories Trend");
-    lv_obj_align(s_title, LV_ALIGN_BOTTOM_MID, 0, -5);
-
-    return s_screen;
-}
-
-void display_calorie_trend_update(const StravaData &data) {
-    if (!s_screen || !s_value || !s_delta_wrap || !s_spark_line) return;
-
+    // ── Build sparkline data ──────────────────────────────────────────────────
     int32_t ref = 0;
     if (data.current_day_days != 0)
         ref = data.current_day_days - 1;
@@ -330,34 +157,95 @@ void display_calorie_trend_update(const StravaData &data) {
 
     float vals[kPtCount] = {};
     float mx = 0.0f;
-    for (int i = 0; i < kPtCount; ++i) {
+    for (int i = 0; i < kPtCount; i++) {
         float cal = 0.0f;
-        if (ref != 0) day_calories(data, ref - (kPtCount - 1 - i), cal);
+        if (ref != 0 && data.valid)
+            day_calories(data, ref - (kPtCount - 1 - i), cal);
         vals[i] = cal;
         if (cal > mx) mx = cal;
     }
     if (mx < 1.0f) mx = 1.0f;
 
-    for (int i = 0; i < kPtCount; ++i) {
-        int px = pt_x(i);
-        int py = pt_y(vals[i] / mx);
-        const int dot_d = (i == (kPtCount - 1)) ? kTodayDotD : kDotD;
-        s_pts[i].x = px;
-        s_pts[i].y = py;
-        lv_obj_set_pos(s_dots[i], px - dot_d / 2, py - dot_d / 2);
-        if (i == (kPtCount - 1) && s_today_halo) {
-            lv_obj_set_pos(s_today_halo, px - kTodayHaloD / 2, py - kTodayHaloD / 2);
-        }
-        lv_label_set_text(s_day_labels[i],
-                          weekday_short(weekday_sun0(ref - (kPtCount - 1 - i))));
+    for (int i = 0; i < kPtCount; i++) {
+        s_pts[i].x = (float)pt_x(i);
+        s_pts[i].y = (float)pt_y(vals[i] / mx);
     }
     rebuild_smooth_curve_points();
-    lv_line_set_points(s_spark_line, s_curve_pts, kCurvePtCount);
 
-    const float day_minus_1 = vals[kPtCount - 1];
-    const float day_minus_2 = vals[kPtCount - 2];
-    const float delta = day_minus_1 - day_minus_2;
+    // ── Draw sparkline ────────────────────────────────────────────────────────
+    uint16_t trend_col = RGB565(0x4C, 0xC9, 0xF0);
+    for (int i = 0; i < kCurvePtCount - 1; i++) {
+        spr.drawLine(
+            kChartX + (int)lroundf(s_curve_pts[i].x),
+            kChartY + (int)lroundf(s_curve_pts[i].y),
+            kChartX + (int)lroundf(s_curve_pts[i + 1].x),
+            kChartY + (int)lroundf(s_curve_pts[i + 1].y),
+            trend_col);
+    }
 
-    lv_label_set_text_fmt(s_value, "%d", (int)lroundf(day_minus_1));
-    set_delta_marker(delta);
+    // ── Dots + day labels ─────────────────────────────────────────────────────
+    for (int i = 0; i < kPtCount; i++) {
+        int px = kChartX + pt_x(i);
+        int py = kChartY + pt_y(vals[i] / mx);
+        const int dot_d = (i == kPtCount - 1) ? kTodayDotD : kDotD;
+        uint8_t lvl = data.valid ? calorie_burn_level(vals[i]) : 0u;
+        uint16_t dcol = cal_level_color(lvl);
+
+        // Today halo (ring)
+        if (i == kPtCount - 1) {
+            spr.drawCircle(px, py, kTodayHaloD / 2, dcol);
+        }
+        spr.fillCircle(px, py, dot_d / 2, dcol);
+
+        // Day label
+        const char *dl = (ref != 0)
+            ? weekday_short(weekday_sun0(ref - (kPtCount - 1 - i)))
+            : "-";
+        spr.setTextFont(2);
+        spr.setTextColor(RGB565(0x9C, 0xB0, 0xC1));
+        spr.setTextDatum(TC_DATUM);
+        spr.drawString(dl, px, kChartY + kBaseline + 6);
+    }
+
+    // ── Summary card ─────────────────────────────────────────────────────────
+    spr.fillRoundRect(kSummaryX, kSummaryY, kSummaryW, kSummaryH, 20,
+                      RGB565(0x11, 0x1A, 0x22));
+    spr.drawRoundRect(kSummaryX, kSummaryY, kSummaryW, kSummaryH, 20,
+                      RGB565(0x26, 0x37, 0x46));
+
+    // Header "day - 1"
+    spr.setTextFont(2);
+    spr.setTextColor(RGB565(0x7F, 0xD6, 0xF8));
+    spr.setTextDatum(TC_DATUM);
+    spr.drawString("day - 1", kSummaryX + kSummaryW / 2, kSummaryY + 6);
+
+    // Large calorie value
+    float day_minus_1 = vals[kPtCount - 1];
+    float day_minus_2 = vals[kPtCount - 2];
+    char val_buf[8];
+    snprintf(val_buf, sizeof(val_buf), "%d", (int)lroundf(day_minus_1));
+    spr.setTextFont(4);
+    spr.setTextColor(TFT_WHITE);
+    spr.setTextDatum(MC_DATUM);
+    spr.drawString(val_buf, kSummaryX + kSummaryW / 2, kSummaryY + kSummaryH / 2 - 12);
+
+    // Delta marker
+    draw_delta_marker(spr,
+        kSummaryX + (kSummaryW - 16) / 2,
+        kSummaryY + kSummaryH / 2 + 16,
+        day_minus_1 - day_minus_2);
+
+    // "k.cal" unit label (bottom, aligned to bottom of day labels in chart)
+    const int unit_y = kChartY + kBaseline + 6 - kSummaryY;
+    spr.setTextFont(2);
+    spr.setTextColor(RGB565(0x9C, 0xB0, 0xC1));
+    spr.setTextDatum(TC_DATUM);
+    spr.drawString("k.cal", kSummaryX + kSummaryW / 2, kSummaryY + unit_y);
+
+    // Title bottom-centre
+    spr.setTextFont(2);
+    spr.setTextDatum(BC_DATUM);
+    spr.setTextColor(C_STRAVA);
+    spr.drawString("Calories Trend", DISP_W / 2, DISP_H - 5);
 }
+

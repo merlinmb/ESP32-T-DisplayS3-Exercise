@@ -7,17 +7,17 @@
 
 uint8_t exercise_load_level(float load) {
     if (load <= 0.0f)   return 0;
-    if (load < 50.0f)   return 1;
-    if (load < 100.0f)  return 2;
-    if (load < 150.0f)  return 3;
+    if (load <= 30.0f)  return 1;
+    if (load <= 60.0f)  return 2;
+    if (load <= 120.0f) return 3;
     return 4;
 }
 
 uint8_t calorie_burn_level(float calories) {
-    if (calories <= 0.0f)  return 0;
-    if (calories < 250.0f) return 1;
-    if (calories < 500.0f) return 2;
-    if (calories < 750.0f) return 3;
+    if (calories <= 0.0f)   return 0;
+    if (calories <= 500.0f) return 1;
+    if (calories <= 750.0f) return 2;
+    if (calories <= 1000.0f) return 3;
     return 4;
 }
 
