@@ -19,10 +19,10 @@ static const int kPtCount    =  7;
 // Spark content inside chart card: pushed right & down to clear rounded corners
 static const int kSparkLeft  = 15;   // was 7
 static const int kSparkRight = 205;  // was 189
-static const int kSparkTop   = 10;   // was 4
-static const int kSparkBot   = 100;  // was 94  (+6 to match top shift)
-static const int kBaseline   = 105;  // was 99  (+6 to match top shift)
-static const int kDotD       =  7;
+static const int kSparkTop   = 13;   // was 4
+static const int kSparkBot   = 103;  // was 94  (+9 to match top shift)
+static const int kBaseline   = 108;  // was 99  (+9 to match top shift)
+static const int kDotD       =  9;
 static const int kTodayDotD  = 11;
 static const int kTodayHaloD = 15;  // kTodayDotD + 4
 static const int kCurveSamplesPerSegment = 10;
@@ -107,10 +107,10 @@ static void rebuild_smooth_curve_points() {
     s_curve_pts[out_idx] = s_pts[kPtCount - 1];
 }
 
-// ── Delta marker helpers ──────────────────────────────────────────────────────
-// Draw a simple 3-row filled triangle or flat bar in the summary card.
-// wx,wy = top-left corner of the 16×10 marker area within the sprite.
-static void draw_delta_marker(TFT_eSprite &spr, int wx, int wy, float delta) {
+// ── Delta glyph helpers ───────────────────────────────────────────────────────
+// Draw a compact 3-row filled triangle or flat bar.
+// wx,wy = top-left corner of the 16×10 glyph area within the sprite.
+static void draw_delta_glyph(TFT_eSprite &spr, int wx, int wy, float delta) {
     if (delta > 0.5f) {
         // Up triangle: rows narrow from bottom to top
         static const int up_w[3] = {13, 9, 5};
@@ -173,14 +173,15 @@ void display_calorie_trend_render(TFT_eSprite &spr, const StravaData &data) {
     rebuild_smooth_curve_points();
 
     // ── Draw sparkline ────────────────────────────────────────────────────────
-    uint16_t trend_col = RGB565(0x4C, 0xC9, 0xF0);
+    uint16_t trend_col = TFT_WHITE;
     for (int i = 0; i < kCurvePtCount - 1; i++) {
-        spr.drawLine(
-            kChartX + (int)lroundf(s_curve_pts[i].x),
-            kChartY + (int)lroundf(s_curve_pts[i].y),
-            kChartX + (int)lroundf(s_curve_pts[i + 1].x),
-            kChartY + (int)lroundf(s_curve_pts[i + 1].y),
-            trend_col);
+        int x0 = kChartX + (int)lroundf(s_curve_pts[i].x);
+        int y0 = kChartY + (int)lroundf(s_curve_pts[i].y);
+        int x1 = kChartX + (int)lroundf(s_curve_pts[i + 1].x);
+        int y1 = kChartY + (int)lroundf(s_curve_pts[i + 1].y);
+        spr.drawLine(x0, y0 - 1, x1, y1 - 1, trend_col);
+        spr.drawLine(x0, y0, x1, y1, trend_col);
+        spr.drawLine(x0, y0 + 1, x1, y1 + 1, trend_col);
     }
 
     // ── Dots + day labels ─────────────────────────────────────────────────────
@@ -213,34 +214,60 @@ void display_calorie_trend_render(TFT_eSprite &spr, const StravaData &data) {
     spr.drawRoundRect(kSummaryX, kSummaryY, kSummaryW, kSummaryH, 20,
                       RGB565(0x26, 0x37, 0x46));
 
-    // Header "day - 1"
+    float day_minus_1 = vals[kPtCount - 1];
+    float day_minus_2 = vals[kPtCount - 2];
+    float today_cal = 0.0f;
+    if (data.valid && data.current_day_days != 0)
+        day_calories(data, data.current_day_days, today_cal);
+
+    const int summary_center_x = kSummaryX + kSummaryW / 2;
+    const int metric_top_y = kSummaryY + 10;
+    const int metric_bot_y = kSummaryY + 70;
+    const int glyph_w = 16;
+    const int glyph_gap = 4;
+
+    char val_buf[8];
+
+    // Yesterday block
     spr.setTextFont(2);
     spr.setTextColor(RGB565(0x7F, 0xD6, 0xF8));
     spr.setTextDatum(TC_DATUM);
-    spr.drawString("day - 1", kSummaryX + kSummaryW / 2, kSummaryY + 6);
+    spr.drawString("day - 1", summary_center_x, metric_top_y);
 
-    // Large calorie value
-    float day_minus_1 = vals[kPtCount - 1];
-    float day_minus_2 = vals[kPtCount - 2];
-    char val_buf[8];
     snprintf(val_buf, sizeof(val_buf), "%d", (int)lroundf(day_minus_1));
+    int top_value_x = summary_center_x + (glyph_w + glyph_gap) / 2;
+    int top_value_y = metric_top_y + 35;
     spr.setTextFont(4);
     spr.setTextColor(TFT_WHITE);
     spr.setTextDatum(MC_DATUM);
-    spr.drawString(val_buf, kSummaryX + kSummaryW / 2, kSummaryY + kSummaryH / 2 - 12);
-
-    // Delta marker
-    draw_delta_marker(spr,
-        kSummaryX + (kSummaryW - 16) / 2,
-        kSummaryY + kSummaryH / 2 + 16,
+    draw_delta_glyph(spr,
+        top_value_x - glyph_gap - glyph_w - 22,
+        top_value_y - 5,
         day_minus_1 - day_minus_2);
+    spr.drawString(val_buf, top_value_x, top_value_y);
 
-    // "k.cal" unit label (bottom, aligned to bottom of day labels in chart)
-    const int unit_y = kChartY + kBaseline + 6 - kSummaryY;
+    // Today block
+    spr.setTextFont(2);
+    spr.setTextColor(RGB565(0x7F, 0xD6, 0xF8));
+    spr.setTextDatum(TC_DATUM);
+    spr.drawString("today", summary_center_x, metric_bot_y - 3);
+
+    snprintf(val_buf, sizeof(val_buf), "%d", (int)lroundf(today_cal));
+    int today_value_y = metric_bot_y + 30;
+    spr.setTextFont(4);
+    spr.setTextColor(TFT_WHITE);
+    spr.setTextDatum(MC_DATUM);
+    draw_delta_glyph(spr,
+        top_value_x - glyph_gap - glyph_w - 22,
+        today_value_y - 5,
+        today_cal - day_minus_1);
+    spr.drawString(val_buf, top_value_x, today_value_y);
+
+    // "k.cal" unit label (shared for both metrics)
     spr.setTextFont(2);
     spr.setTextColor(RGB565(0x9C, 0xB0, 0xC1));
     spr.setTextDatum(TC_DATUM);
-    spr.drawString("k.cal", kSummaryX + kSummaryW / 2, kSummaryY + unit_y);
+    spr.drawString("k.cal", summary_center_x, kSummaryY + kSummaryH - 17);
 
     // Title bottom-centre
     spr.setTextFont(2);

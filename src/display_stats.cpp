@@ -6,13 +6,17 @@
 void display_stats_render(TFT_eSprite &spr, const StravaData &data,
                           uint32_t age_minutes) {
     // Three stat cards side by side, vertically centred.
-    // Layout: screen 320×170, footer 28 px, cards 92×90 px, 10 px gap.
-    static const int FOOTER_H = 28;
-    static const int CARD_W   = 92;
-    static const int CARD_H   = 110;
-    static const int CARD_GAP = 10;
-    static const int CARDS_LEFT = (320 - (CARD_W * 3 + CARD_GAP * 2)) / 2;  // 17
-    static const int CARD_TOP   = (170 - FOOTER_H - CARD_H) / 2;            // 26
+    // Layout: screen 320×170, footer 28 px, 4 px outer margin, 3 px gap.
+    static const int SCREEN_W     = 320;
+    static const int SCREEN_H     = 170;
+    static const int FOOTER_H     = 28;
+    static const int OUTER_MARGIN = 4;
+    static const int CARD_H       = 98;
+    static const int CARD_GAP     = 3;
+    static const int CARD_W       = (SCREEN_W - OUTER_MARGIN * 2 - CARD_GAP * 2) / 3;
+    static const int CARDS_LEFT   = (SCREEN_W - (CARD_W * 3 + CARD_GAP * 2)) / 2;
+    static const int CARD_TOP     = ((SCREEN_H - FOOTER_H - 110) / 2) + 16;
+    static const int CARD_FRAME_TOP = CARD_TOP + 8;
 
     struct CardDef {
         const char *label;
@@ -29,8 +33,8 @@ void display_stats_render(TFT_eSprite &spr, const StravaData &data,
         int cx = CARDS_LEFT + i * (CARD_W + CARD_GAP);
 
         // Card background
-        spr.fillRoundRect(cx, CARD_TOP, CARD_W, CARD_H, 10, C_PANEL);
-        spr.drawRoundRect(cx, CARD_TOP, CARD_W, CARD_H, 10, C_BORDER);
+        spr.fillRoundRect(cx, CARD_FRAME_TOP, CARD_W, CARD_H, 10, C_PANEL);
+        spr.drawRoundRect(cx, CARD_FRAME_TOP, CARD_W, CARD_H, 10, C_BORDER);
 
         // Value label (Font4, ~26 px) – centred horizontally
         char val_buf[16] = "--";
@@ -51,15 +55,14 @@ void display_stats_render(TFT_eSprite &spr, const StravaData &data,
         spr.setFreeFont(&FreeSansBold18pt7b);
         spr.setTextSize(1);
         spr.setTextColor(CARDS[i].color);
-        spr.setTextDatum(TC_DATUM);
-        spr.drawString(val_buf, cx + CARD_W / 2, CARD_TOP + 8);
+        spr.setTextDatum(MC_DATUM);
+        spr.drawString(val_buf, cx + CARD_W / 2, (CARD_TOP + CARD_H / 2)-10 );
 
         // Sub-label (FreeSansBold9pt7b, bold) – centred in card
         char sub_buf[16];
         if (i == 0 && data.valid && data.current_month >= 1 && data.current_month <= 12) {
             static const char *MO[12] = {
-                "JAN","FEB","MAR","APR","MAY","JUN",
-                "JUL","AUG","SEP","OCT","NOV","DEC"
+                "Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"
             };
             snprintf(sub_buf, sizeof(sub_buf), "%s load", MO[data.current_month - 1]);
         } else {
@@ -70,18 +73,18 @@ void display_stats_render(TFT_eSprite &spr, const StravaData &data,
         spr.setTextSize(1);
         spr.setTextColor(TFT_WHITE);
         spr.setTextDatum(TC_DATUM);
-        spr.drawString(sub_buf, cx + CARD_W / 2, CARD_TOP + 77);
+        spr.drawString(sub_buf, cx + CARD_W / 2, CARD_TOP + 69);
         spr.setTextFont(2);  // restore built-in font
     }
 
     // ── Footer ────────────────────────────────────────────────────────────────
-    const int fy = 170 - FOOTER_H;
-    spr.fillRect(0, fy, 320, FOOTER_H, TFT_BLACK);
+    const int fy = SCREEN_H - FOOTER_H;
+    spr.fillRect(0, fy, SCREEN_W, FOOTER_H, TFT_BLACK);
 
     spr.setTextFont(2);
     spr.setTextDatum(MC_DATUM);
     spr.setTextColor(C_STRAVA);
-    spr.drawString("Exercise Load", 320 / 2, fy + FOOTER_H / 2);
+    spr.drawString("Exercise Load", SCREEN_W / 2, fy + FOOTER_H / 2);
 
     // Age label (bottom-right)
     char age_buf[32] = "";

@@ -33,7 +33,7 @@ static constexpr uint16_t LEVEL_BASE[5] = {
 static constexpr uint16_t LEVEL_BRIGHT[5] = {
     RGB565(0x17, 0x1B, 0x20),  // 0 no animation
     RGB565(0x2E, 0xCC, 0x71),  // 1 bright green
-    RGB565(0xF1, 0xC4, 0x0F),  // 2 yellow (unchanged)
+    RGB565(0xFF, 0xD6, 0x3B),  // 2 bright yellow
     RGB565(0xF0, 0x93, 0x2B),  // 3 bright orange
     RGB565(0xFF, 0x52, 0x52),  // 4 bright red
 };
