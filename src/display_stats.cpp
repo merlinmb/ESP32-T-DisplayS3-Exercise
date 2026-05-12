@@ -9,7 +9,7 @@ void display_stats_render(TFT_eSprite &spr, const StravaData &data,
     // Layout: screen 320×170, footer 28 px, cards 92×90 px, 10 px gap.
     static const int FOOTER_H = 28;
     static const int CARD_W   = 92;
-    static const int CARD_H   = 90;
+    static const int CARD_H   = 110;
     static const int CARD_GAP = 10;
     static const int CARDS_LEFT = (320 - (CARD_W * 3 + CARD_GAP * 2)) / 2;  // 17
     static const int CARD_TOP   = (170 - FOOTER_H - CARD_H) / 2;            // 26
@@ -70,7 +70,7 @@ void display_stats_render(TFT_eSprite &spr, const StravaData &data,
         spr.setTextSize(1);
         spr.setTextColor(TFT_WHITE);
         spr.setTextDatum(TC_DATUM);
-        spr.drawString(sub_buf, cx + CARD_W / 2, CARD_TOP + 63);
+        spr.drawString(sub_buf, cx + CARD_W / 2, CARD_TOP + 77);
         spr.setTextFont(2);  // restore built-in font
     }
 

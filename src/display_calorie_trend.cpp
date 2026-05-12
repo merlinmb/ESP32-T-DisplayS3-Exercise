@@ -10,15 +10,15 @@ static const int kSummaryH   = 137;
 static const int kSummaryX   = DISP_W - kSummaryW - 1;  // 235
 static const int kSummaryY   =   4;
 
-static const int kChartX     =   1;
+static const int kChartX     =   5;
 static const int kChartY     =   4;   // top-aligned with summary card
-static const int kChartW     = kSummaryX - kChartX - 4;  // 230 (4px gap)
+static const int kChartW     = kSummaryX - kChartX - 5;  // 225 (5px gaps each side)
 static const int kChartH     = 137;
 
 static const int kPtCount    =  7;
 // Spark content inside chart card: pushed right & down to clear rounded corners
 static const int kSparkLeft  = 15;   // was 7
-static const int kSparkRight = 210;  // was 189
+static const int kSparkRight = 205;  // was 189
 static const int kSparkTop   = 10;   // was 4
 static const int kSparkBot   = 100;  // was 94  (+6 to match top shift)
 static const int kBaseline   = 105;  // was 99  (+6 to match top shift)
