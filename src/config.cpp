@@ -3,6 +3,16 @@
 
 static Preferences prefs;
 
+namespace {
+
+void remove_pref_if_present(const char *key) {
+    if (prefs.isKey(key)) {
+        prefs.remove(key);
+    }
+}
+
+}
+
 void config_apply_defaults(Config &cfg) {
     // Clamp brightness: 0 is a valid off state, values >100 reset to 100 %.
     if (cfg.brightness > 100) cfg.brightness = 100;
@@ -14,7 +24,7 @@ void config_apply_defaults(Config &cfg) {
     if (cfg.anim_period_ms == 0)       cfg.anim_period_ms       = 2000;
     if (cfg.mqtt_port == 0)            cfg.mqtt_port            = 1883;
     if (cfg.mqtt_lcd_topic[0] == '\0')
-        strncpy(cfg.mqtt_lcd_topic, "cmnd/mcmddevices/lcdbrightness",
+        strncpy(cfg.mqtt_lcd_topic, "cmnd/mcmddevices/brightnesspercentage",
                 sizeof(cfg.mqtt_lcd_topic) - 1);
 }
 
@@ -62,11 +72,11 @@ void config_save(const Config &cfg) {
     prefs.putString("mqtt_host",   cfg.mqtt_broker);
     prefs.putUShort("mqtt_port",   cfg.mqtt_port);
     prefs.putString("mqtt_lcd",    cfg.mqtt_lcd_topic);
-    prefs.remove("rgb_bright");
-    prefs.remove("rgb_pmin");
-    prefs.remove("rgb_pmax");
-    prefs.remove("rgb_smax");
-    prefs.remove("mqtt_ctopic");
-    prefs.remove("mqtt_ltopic");
+    remove_pref_if_present("rgb_bright");
+    remove_pref_if_present("rgb_pmin");
+    remove_pref_if_present("rgb_pmax");
+    remove_pref_if_present("rgb_smax");
+    remove_pref_if_present("mqtt_ctopic");
+    remove_pref_if_present("mqtt_ltopic");
     prefs.end();
 }

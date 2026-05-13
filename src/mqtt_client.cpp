@@ -4,6 +4,8 @@
 #include <PubSubClient.h>
 #include <WiFi.h>
 #include <Arduino.h>
+#include <ctype.h>
+#include <stdlib.h>
 
 static WiFiClient   s_wifi_client;
 static PubSubClient s_mqtt(s_wifi_client);
@@ -44,27 +46,70 @@ static void mqttTransmitInitStat() {
     mqttTransmitInitStat(String(kMqttDeviceName));
 }
 
+static bool parse_brightness_payload(byte *payload, unsigned int len, uint8_t &pct_out) {
+    if (!payload || len == 0 || len >= 16) return false;
+
+    char buf[16];
+    memcpy(buf, payload, len);
+    buf[len] = '\0';
+
+    char *start = buf;
+    while (*start && isspace((unsigned char)*start)) ++start;
+
+    char *end = start + strlen(start);
+    while (end > start && isspace((unsigned char)end[-1])) --end;
+    *end = '\0';
+
+    if (*start == '"' && end - start >= 2 && end[-1] == '"') {
+        ++start;
+        --end;
+        *end = '\0';
+        while (*start && isspace((unsigned char)*start)) ++start;
+        while (end > start && isspace((unsigned char)end[-1])) --end;
+        *end = '\0';
+    }
+
+    if (*start == '\0') return false;
+
+    char *parse_end = nullptr;
+    long raw = strtol(start, &parse_end, 10);
+    if (parse_end == start) return false;
+
+    while (*parse_end && isspace((unsigned char)*parse_end)) ++parse_end;
+    if (*parse_end == '.') {
+        ++parse_end;
+        while (*parse_end == '0') ++parse_end;
+        while (*parse_end && isspace((unsigned char)*parse_end)) ++parse_end;
+    }
+    if (*parse_end != '\0') return false;
+
+    if (raw < 0) raw = 0;
+    if (raw > 100) raw = 100;
+    pct_out = (uint8_t)raw;
+    return true;
+}
+
 // ── Message handler ───────────────────────────────────────────────────────────
 
 static void on_message(const char *topic, byte *payload, unsigned int len) {
     if (!s_cfg || !topic || !payload) return;
-    if (len == 0 || len > 4) return; // 0-100 is at most 3 digits
+    if (!mqtt_has_topic(s_cfg->mqtt_lcd_topic) || strcmp(topic, s_cfg->mqtt_lcd_topic) != 0) return;
 
-    char buf[5];
-    memcpy(buf, payload, len);
-    buf[len] = '\0';
-
-    int raw = atoi(buf);
-    if (raw < 0)   raw = 0;
-    if (raw > 100) raw = 100;
-    uint8_t pct = (uint8_t)raw;
-
-    if (mqtt_has_topic(s_cfg->mqtt_lcd_topic) && strcmp(topic, s_cfg->mqtt_lcd_topic) == 0) {
-        Serial.printf("[MQTT] LCD brightness -> %d%%\n", pct);
-        s_cfg->brightness = pct;
-        set_screen_brightness_pct(pct);
-        s_save_pending = true;
+    uint8_t pct = 0;
+    if (!parse_brightness_payload(payload, len, pct)) {
+        unsigned int preview_len = len < 32 ? len : 32;
+        Serial.printf("[MQTT] Ignored brightness payload on '%s': '%.*s' (len=%u)\n",
+                      topic,
+                      (int)preview_len,
+                      (const char *)payload,
+                      len);
+        return;
     }
+
+    Serial.printf("[MQTT] LCD brightness -> %u%%\n", pct);
+    s_cfg->brightness = pct;
+    set_screen_brightness_pct(pct);
+    s_save_pending = true;
 }
 
 // ── Connection helper ─────────────────────────────────────────────────────────
@@ -80,8 +125,10 @@ static bool try_connect() {
         return false;
     }
     if (mqtt_has_topic(s_cfg->mqtt_lcd_topic)) {
-        s_mqtt.subscribe(s_cfg->mqtt_lcd_topic);
-        Serial.printf("[MQTT] Connected. Subscribed to '%s'\n", s_cfg->mqtt_lcd_topic);
+        bool subscribed = s_mqtt.subscribe(s_cfg->mqtt_lcd_topic);
+        Serial.printf("[MQTT] Connected. %s '%s'\n",
+                      subscribed ? "Subscribed to" : "Subscribe failed for",
+                      s_cfg->mqtt_lcd_topic);
     } else {
         Serial.println("[MQTT] Connected. No topic configured");
     }
