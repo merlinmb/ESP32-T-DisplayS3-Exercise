@@ -11,9 +11,9 @@ services:
       - "8082:8082"
 
     volumes:
-      # Mount the statistics-for-strava storage directory read-only.
+      # Must be writable: the DB is in WAL mode, so SQLite needs to create strava.db-shm/-wal even for reads.
       # The bridge expects the SQLite file to be at /data/database/strava.db inside the container.
-      - /home/merlin/portainer_data/strava/storage:/data:ro
+      - /home/merlin/portainer_data/strava/storage:/data
 
     # Optional: join an existing Docker network if you run other strava containers
     # networks:
